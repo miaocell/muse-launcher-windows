@@ -62,7 +62,7 @@ public sealed class AccountWebHost : IDisposable
             {
                 UserDataFolder = ProfileDir(a.Id),
                 // 代理是浏览器进程级参数；每账号独立 UserDataFolder = 独立进程 = 代理真正按账号隔离
-                AdditionalBrowserArguments = string.Join(" ", ProxyUtil.BrowserArgsFor(a.Proxy)),
+                AdditionalBrowserArguments = string.Join(" ", ProxyUtil.BrowserArgsFor(a.Proxy, a.ForceProxy)),
             },
         };
 
@@ -95,8 +95,12 @@ public sealed class AccountWebHost : IDisposable
                 }
                 e.Response.UserName = proxyCreds[0];
                 e.Response.Password = proxyCreds[1];
-                Log.I("MuseProxy", $"407 answered id={a.Id} host={challengeHost}");
+                Log.I("MuseProxy", $"407 answered id={a.Id} host={challengeHost} scheme={e.Challenge}");
             };
+
+            // SOCKS5 账密不走 407：Chromium 用 --proxy-auth-scheme=basic 后由内核直接完成握手，
+            // 若仍未配置成功会走到这里，至少留日志便于排查。
+            Log.I("MuseProxy", $"proxy with creds id={a.Id} server={ProxyUtil.ProxyServerValue(a.Proxy!)}");
         }
 
         // 窗口级弹窗（target=_blank）与安卓 setSupportMultipleWindows(false) 行为对齐：

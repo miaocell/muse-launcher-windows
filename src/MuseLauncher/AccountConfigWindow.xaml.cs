@@ -33,6 +33,7 @@ public partial class AccountConfigWindow : Window
         AvatarInput.Text = account.Avatar;
         NameInput.Text = account.Name;
         ProxyInput.Text = account.Proxy;
+        ForceProxyCheck.IsChecked = account.ForceProxy;
         TagsInput.Text = string.Join(", ", account.Tags);
         UpdateTile();
         Loaded += (_, _) => NameInput.Focus();
@@ -69,6 +70,7 @@ public partial class AccountConfigWindow : Window
         var oldAvatar = account.Avatar;
         var oldName = account.Name;
         var oldTags = string.Join('\u0001', account.Tags);
+        var oldForceProxy = account.ForceProxy;
 
         var avatar = AvatarInput.Text.Trim();
         if (avatar.Length == 0) avatar = "m";
@@ -79,6 +81,7 @@ public partial class AccountConfigWindow : Window
         if (name.Length > 0) account.Name = name.Length > 16 ? name[..16] : name;
 
         account.Proxy = ProxyInput.Text.Trim();
+        account.ForceProxy = ForceProxyCheck.IsChecked == true;
 
         var tags = new List<string>();
         foreach (var t in TagsInput.Text.Split(',', '，'))
@@ -90,8 +93,9 @@ public partial class AccountConfigWindow : Window
         account.Tags = tags;
 
         // 代理拍生效值比较：内嵌账密的写法差异不影响 --proxy-server，无需重建环境
-        ProxyChanged = !string.Equals(
-            ProxyServerOf(oldProxy), ProxyServerOf(account.Proxy), StringComparison.OrdinalIgnoreCase);
+        ProxyChanged = oldForceProxy != account.ForceProxy
+                       || !string.Equals(
+                           ProxyServerOf(oldProxy), ProxyServerOf(account.Proxy), StringComparison.OrdinalIgnoreCase);
 
         Changed = ProxyChanged
                   || oldAvatar != account.Avatar

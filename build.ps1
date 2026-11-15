@@ -2,7 +2,7 @@
 # 用法: powershell -ExecutionPolicy Bypass -File build.ps1
 $ErrorActionPreference = "Stop"
 
-$version = "1.0.2"
+$version = "1.0.3"
 $outDir = "publish/win-x64"
 $zip = "publish/MuseLauncher-win-x64-v$version.zip"
 

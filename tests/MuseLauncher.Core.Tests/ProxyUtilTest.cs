@@ -38,17 +38,16 @@ public class ProxyUtilTest
     public void BrowserArgs_EmbeddedCredentials_Stripped()
     {
         var args = ProxyUtil.BrowserArgsFor("http://user:pass@1.2.3.4:3129");
-        Assert.Single(args);
-        Assert.Equal("--proxy-server=http://1.2.3.4:3129", args[0]);
-        Assert.DoesNotContain("user", args[0]);
-        Assert.DoesNotContain("pass", args[0]);
+        Assert.Contains("--proxy-server=http://1.2.3.4:3129", args);
+        Assert.DoesNotContain(args, a => a.Contains("user") || a.Contains("pass"));
     }
 
     [Fact]
     public void BrowserArgs_SocksWithCreds_StrippedKeepsScheme()
     {
         var args = ProxyUtil.BrowserArgsFor("socks5://u:p@127.0.0.1:1080");
-        Assert.Equal("--proxy-server=socks5://127.0.0.1:1080", args[0]);
+        Assert.Contains("--proxy-server=socks5://127.0.0.1:1080", args);
+        Assert.DoesNotContain(args, a => a.Contains("u:") || a.Contains(":p@"));
     }
 
     [Fact]
@@ -93,5 +92,88 @@ public class ProxyUtilTest
     public void ClashPorts_IncludesVergeDefault()
     {
         Assert.Contains(7897, ProxyUtil.ClashPorts);
+    }
+
+    // ---------- 1024proxy 一类带账密的住宅代理 ----------
+
+    /// <summary>带账密的代理必须附加 basic 认证方案，否则 Chromium 407 会反复重试。</summary>
+    [Fact]
+    public void BrowserArgs_WithCredentials_AddsBasicAuthScheme()
+    {
+        var args = ProxyUtil.BrowserArgsFor("http://user:pass@1.2.3.4:3129");
+        Assert.Contains("--proxy-server=http://1.2.3.4:3129", args);
+        Assert.Contains("--proxy-auth-scheme=basic", args);
+    }
+
+    [Fact]
+    public void BrowserArgs_WithoutCredentials_NoAuthScheme()
+    {
+        var args = ProxyUtil.BrowserArgsFor("127.0.0.1:7897");
+        Assert.Contains("--proxy-server=http://127.0.0.1:7897", args);
+        Assert.DoesNotContain("--proxy-auth-scheme=basic", args);
+    }
+
+    [Fact]
+    public void BrowserArgs_Socks5WithCredentials_AddsAuthScheme()
+    {
+        var args = ProxyUtil.BrowserArgsFor("socks5://user:pass@gate.1024proxy.io:1080");
+        Assert.Contains("--proxy-server=socks5://gate.1024proxy.io:1080", args);
+        Assert.Contains("--proxy-auth-scheme=basic", args);
+    }
+
+    /// <summary>强制走代理时用 &lt;-loopback&gt; 取消本机直连豁免，避免真实 IP 泄露。</summary>
+    [Fact]
+    public void BrowserArgs_ForceProxy_AddsBypassOverride()
+    {
+        var args = ProxyUtil.BrowserArgsFor("http://user:pass@1.2.3.4:3129", forceProxy: true);
+        Assert.Contains("--proxy-bypass-list=<-loopback>", args);
+    }
+
+    [Fact]
+    public void BrowserArgs_NotForced_NoBypassOverride()
+    {
+        var args = ProxyUtil.BrowserArgsFor("http://1.2.3.4:3129");
+        Assert.DoesNotContain("--proxy-bypass-list=<-loopback>", args);
+    }
+
+    /// <summary>空代理即便勾了强制也不应生成任何参数（没有代理可走）。</summary>
+    [Fact]
+    public void BrowserArgs_EmptyProxy_ForceStillNoArgs()
+    {
+        Assert.Empty(ProxyUtil.BrowserArgsFor("", forceProxy: true));
+        Assert.Empty(ProxyUtil.BrowserArgsFor(null, forceProxy: true));
+    }
+
+    /// <summary>只有账密没有主机属于无效输入，不应生成残缺的 --proxy-server。</summary>
+    [Fact]
+    public void BrowserArgs_CredentialsOnly_NoArgs()
+    {
+        Assert.Empty(ProxyUtil.BrowserArgsFor("http://user:pass@"));
+    }
+
+    [Theory]
+    [InlineData("http://u:p@1.2.3.4:3129", true)]
+    [InlineData("socks5://u:p@h:1080", true)]
+    [InlineData("127.0.0.1:7897", false)]
+    [InlineData("", false)]
+    public void HasCredentials_Works(string proxy, bool expected)
+    {
+        Assert.Equal(expected, ProxyUtil.HasCredentials(proxy));
+    }
+
+    /// <summary>每个账号的代理互不影响：同一方法对不同账号输入产出不同参数（多账号分代理的核心保证）。</summary>
+    [Fact]
+    public void BrowserArgs_PerAccountIsolation()
+    {
+        var a = ProxyUtil.BrowserArgsFor("http://u1:p1@gate-a.example:8000");
+        var b = ProxyUtil.BrowserArgsFor("http://u2:p2@gate-b.example:8000");
+
+        Assert.Contains("--proxy-server=http://gate-a.example:8000", a);
+        Assert.Contains("--proxy-server=http://gate-b.example:8000", b);
+        Assert.DoesNotContain(a, x => x.Contains("gate-b"));
+        Assert.DoesNotContain(b, x => x.Contains("gate-a"));
+        // 账密不得出现在任何启动参数中（泄漏到进程命令行）
+        Assert.DoesNotContain(a, x => x.Contains("u1") || x.Contains("p1"));
+        Assert.DoesNotContain(b, x => x.Contains("u2") || x.Contains("p2"));
     }
 }

@@ -75,6 +75,30 @@ public class AccountJsonCodecTest
         Assert.Equal(1, output.Count);
         Assert.Equal("m", output[0].Avatar);
         Assert.Equal("", output[0].Proxy);
+        Assert.False(output[0].ForceProxy);
         Assert.Empty(output[0].Tags);
+    }
+
+    /// <summary>强制走代理开关需要持久化，否则重启后设置丢失、真实 IP 可能泄露。</summary>
+    [Fact]
+    public void ForceProxy_RoundTrips()
+    {
+        var a = new Account(7, "代理号") { Proxy = "http://u:p@1.2.3.4:3129", ForceProxy = true };
+        var json = AccountJsonCodec.ToJson(new List<Account> { a })!;
+        var back = AccountJsonCodec.FromJsonOrNull(json)![0];
+        Assert.True(back.ForceProxy);
+        Assert.Equal("http://u:p@1.2.3.4:3129", back.Proxy);
+    }
+
+    /// <summary>旧版本 accounts.json 没有 forceProxy 字段，必须能正常读入（向后兼容）。</summary>
+    [Fact]
+    public void LegacyJsonWithoutForceProxy_StillLoads()
+    {
+        var back = AccountJsonCodec.FromJsonOrNull(
+            "[{\"id\":2,\"name\":\"老账号\",\"avatar\":\"m\",\"proxy\":\"127.0.0.1:7890\",\"tags\":[\"主力\"]}]")!;
+        Assert.Single(back);
+        Assert.False(back[0].ForceProxy);
+        Assert.Equal("老账号", back[0].Name);
+        Assert.Equal("主力", back[0].Tags[0]);
     }
 }

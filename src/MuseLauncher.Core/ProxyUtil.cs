@@ -95,12 +95,50 @@ public static class ProxyUtil
     /// </summary>
     public static List<string> BrowserArgsFor(string? proxy)
     {
+        return BrowserArgsFor(proxy, forceProxy: false);
+    }
+
+    /// <summary>
+    /// WebView2 环境的代理启动参数。
+    /// <para>
+    /// 关键点（针对 1024proxy 一类需要账密的代理服务）：
+    /// 1. 剥离 URL 内嵌账密，只传 scheme://host:port；
+    /// 2. 带账密时附加 <c>--proxy-auth-scheme=basic</c>：Chromium 默认用 negotiate，
+    ///    服务端只支持 Basic 时会导致 407 反复重试、页面白屏；
+    /// 3. forceProxy 时附加 <c>--proxy-bypass-list=&lt;-loopback&gt;</c> 并把
+    ///    <c>&lt;-loopback&gt;</c> 之外全部走代理，避免 localhost/内网规则导致真实 IP 泄露。
+    /// </para>
+    /// </summary>
+    public static List<string> BrowserArgsFor(string? proxy, bool forceProxy)
+    {
         var args = new List<string>();
-        if (!string.IsNullOrWhiteSpace(proxy))
+        if (string.IsNullOrWhiteSpace(proxy)) return args;
+
+        var server = ProxyServerValue(proxy);
+        if (server.Length == 0) return args; // 只有账密没有主机：不生成参数，回退系统网络
+
+        args.Add("--proxy-server=" + server);
+
+        // Chromium 对支持 Basic 的代理需要显式指定认证方案，否则 407 会陷入重试
+        if (ParseProxyCreds(proxy) != null)
         {
-            args.Add("--proxy-server=" + ProxyServerValue(proxy));
+            args.Add("--proxy-auth-scheme=basic");
         }
+
+        if (forceProxy)
+        {
+            // <-loopback> 的作用是「取消默认的 loopback 直连豁免」，即连本机也走代理
+            args.Add("--proxy-bypass-list=<-loopback>");
+        }
+
         return args;
     }
+
+    /// <summary>代理是否带账密（决定是否需要 407 应答与 basic 认证方案）。</summary>
+    public static bool HasCredentials(string? proxy)
+    {
+        return !string.IsNullOrWhiteSpace(proxy) && ParseProxyCreds(proxy) != null;
+    }
+
 }
 

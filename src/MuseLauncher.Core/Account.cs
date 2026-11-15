@@ -20,6 +20,12 @@ public class Account
     /// <summary>代理地址，空 = 跟随系统网络</summary>
     public string Proxy { get; set; } = "";
 
+    /// <summary>
+    /// 强制所有流量走代理（含本机地址），防止 bypass 规则导致真实 IP 泄露。
+    /// 仅在有代理时生效。
+    /// </summary>
+    public bool ForceProxy { get; set; }
+
     /// <summary>标签（侧栏可按标签搜索）</summary>
     public List<string> Tags { get; set; } = new();
 

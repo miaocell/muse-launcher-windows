@@ -29,6 +29,7 @@ public static class AccountJsonCodec
                     ["name"] = a.Name,
                     ["avatar"] = a.Avatar,
                     ["proxy"] = a.Proxy,
+                    ["forceProxy"] = a.ForceProxy,
                     ["tags"] = a.Tags,
                 });
             }
@@ -74,6 +75,8 @@ public static class AccountJsonCodec
                         a.Avatar = avatar.GetString() ?? "m";
                     if (el.TryGetProperty("proxy", out var proxy) && proxy.ValueKind == JsonValueKind.String)
                         a.Proxy = proxy.GetString() ?? "";
+                    if (el.TryGetProperty("forceProxy", out var fp) && fp.ValueKind is JsonValueKind.True)
+                        a.ForceProxy = true;
                     if (el.TryGetProperty("tags", out var tags) && tags.ValueKind == JsonValueKind.Array)
                     {
                         foreach (var t in tags.EnumerateArray())

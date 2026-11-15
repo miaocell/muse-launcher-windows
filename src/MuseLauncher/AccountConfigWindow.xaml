@@ -76,8 +76,15 @@
             <TextBlock x:Name="TestStatus" DockPanel.Dock="Right" Foreground="#8A9099" FontSize="11.5"
                        VerticalAlignment="Center" TextWrapping="Wrap" MaxWidth="240" TextAlignment="Right"/>
         </DockPanel>
+
+        <!-- 强制走代理：避免 bypass 规则导致真实 IP 泄露 -->
+        <CheckBox x:Name="ForceProxyCheck" Content="强制所有流量走此代理（含本机地址，不绕过）"
+                  Foreground="#C3C8D0" FontSize="11.5" Margin="0,10,0,0"/>
+
         <TextBlock Text="留空则跟随系统网络，支持 http / https / socks5。保存后该账号的环境会立即按新代理重建（登录数据保留）。"
-                   Foreground="#8A9099" FontSize="11" Margin="0,6,0,0" TextWrapping="Wrap"/>
+                   Foreground="#8A9099" FontSize="11" Margin="0,8,0,0" TextWrapping="Wrap"/>
+        <TextBlock Text="带账密写法：http://用户名:密码@host:端口 或 socks5://用户名:密码@host:端口（如 1024proxy 等住宅代理）"
+                   Foreground="#6F7680" FontSize="11" Margin="0,3,0,0" TextWrapping="Wrap"/>
 
         <!-- 标签 -->
         <TextBlock Text="标签" Style="{StaticResource FieldLabel}" Margin="0,16,0,0"/>
