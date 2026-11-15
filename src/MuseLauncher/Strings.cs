@@ -50,12 +50,12 @@ public static class Strings
     public const string ConfigName = "名称";
     public const string ConfigProxy = "代理";
     public const string ConfigProxyPh = "如 127.0.0.1:7890 或 socks5://127.0.0.1:1080";
-    public const string ConfigProxyHint = "留空则跟随系统网络，支持 http / https / socks5。修改代理后重新进入该账号生效。";
+    public const string ConfigProxyHint = "留空则跟随系统网络，支持 http / https / socks5。保存后该账号的环境会立即按新代理重建（登录数据保留）。";
     public const string ConfigProxyDetect = "探测";
     public const string ConfigProxyDetecting = "正在探测本机 Clash 端口…";
     public const string ConfigProxySaved = "已保存到账号";
     public const string ConfigProxyDetectFound = "已检测到本机 Clash 端口 {0}，已自动填入（保存后生效）";
-    public const string ConfigProxyDetectNone = "未检测到 Clash 默认端口（7890/7891/7892），Clash 未启动或使用了非默认端口";
+    public const string ConfigProxyDetectNone = "未检测到 Clash 默认端口（7890/7897/7891/7892），Clash 未启动或使用了非默认端口";
     public const string ConfigProxyTest = "测活";
     public const string ConfigProxyTesting = "测活中…";
     public const string ConfigProxyOk = "连接成功";

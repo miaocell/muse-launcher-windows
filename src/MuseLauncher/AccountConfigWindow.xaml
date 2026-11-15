@@ -76,7 +76,7 @@
             <TextBlock x:Name="TestStatus" DockPanel.Dock="Right" Foreground="#8A9099" FontSize="11.5"
                        VerticalAlignment="Center" TextWrapping="Wrap" MaxWidth="240" TextAlignment="Right"/>
         </DockPanel>
-        <TextBlock Text="留空则跟随系统网络，支持 http / https / socks5。修改代理后重新进入该账号生效。"
+        <TextBlock Text="留空则跟随系统网络，支持 http / https / socks5。保存后该账号的环境会立即按新代理重建（登录数据保留）。"
                    Foreground="#8A9099" FontSize="11" Margin="0,6,0,0" TextWrapping="Wrap"/>
 
         <!-- 标签 -->

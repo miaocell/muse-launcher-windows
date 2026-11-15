@@ -823,11 +823,17 @@ public partial class MainWindow : Window
     {
         var a = store.FindById(id);
         if (a == null) return;
-        var oldProxy = a.Proxy;
         var win = new AccountConfigWindow(a) { Owner = this };
         win.ShowDialog();
+
+        if (win.Changed)
+        {
+            // 配置窗口只改内存对象，落盘必须在这里做（与安卓 AccountConfigActivity.persist 一致）
+            store.Save();
+        }
         RenderAccounts();
-        if (win.Saved && oldProxy != a.Proxy && webViews.Get(id) != null)
+
+        if (win.ProxyChanged && webViews.Get(id) != null)
         {
             // 代理变了：驱逐该账号环境，下次进入按新代理重建（登录数据在磁盘，不受影响）
             EvictWebView(id);

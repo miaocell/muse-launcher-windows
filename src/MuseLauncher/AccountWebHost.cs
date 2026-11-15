@@ -80,6 +80,25 @@ public sealed class AccountWebHost : IDisposable
         var host = new AccountWebHost(a.Id, wv);
         var core = wv.CoreWebView2;
 
+        // 407 代理鉴权：--proxy-server 不支持内嵌账密，账密在这里应答。
+        // 只对「目标 host 与配置的代理 host 一致」的挑战给凭证，避免把代理账密交给普通站点。
+        var proxyHost = ProxyUtil.ProxyHost(a.Proxy);
+        var proxyCreds = ProxyUtil.ParseProxyCreds(a.Proxy ?? "");
+        if (proxyCreds != null)
+        {
+            core.BasicAuthenticationRequested += (_, e) =>
+            {
+                var challengeHost = Uri.TryCreate(e.Uri, UriKind.Absolute, out var u) ? u.Host : null;
+                if (proxyHost == null || !string.Equals(challengeHost, proxyHost, StringComparison.OrdinalIgnoreCase))
+                {
+                    return; // 非代理的普通站点鉴权：交给默认对话框
+                }
+                e.Response.UserName = proxyCreds[0];
+                e.Response.Password = proxyCreds[1];
+                Log.I("MuseProxy", $"407 answered id={a.Id} host={challengeHost}");
+            };
+        }
+
         // 窗口级弹窗（target=_blank）与安卓 setSupportMultipleWindows(false) 行为对齐：
         // 不开新窗口，改为当前视图内导航
         core.NewWindowRequested += (_, e) =>

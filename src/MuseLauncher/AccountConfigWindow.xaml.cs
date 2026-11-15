@@ -17,8 +17,11 @@ public partial class AccountConfigWindow : Window
 
     private readonly Account account;
 
-    /// <summary>保存按钮是否点了保存（调用方据此刷新列表/应用代理）。</summary>
-    public bool Saved { get; private set; }
+    /// <summary>保存后是否有任意字段变化（调用方据此写盘）。</summary>
+    public bool Changed { get; private set; }
+
+    /// <summary>代理的生效目标是否变化（调用方据此驱逐并重建浏览器环境）。</summary>
+    public bool ProxyChanged { get; private set; }
 
     private bool testing;
     private bool detecting;
@@ -59,9 +62,14 @@ public partial class AccountConfigWindow : Window
         Close();
     }
 
-    /// <summary>读取输入并写入 account + store（镜像安卓 persist）。</summary>
+    /// <summary>读取输入并写入 account（镜像安卓 persist）。真正落盘由调用方 store.Save() 完成。</summary>
     private void Persist()
     {
+        var oldProxy = account.Proxy;
+        var oldAvatar = account.Avatar;
+        var oldName = account.Name;
+        var oldTags = string.Join('\u0001', account.Tags);
+
         var avatar = AvatarInput.Text.Trim();
         if (avatar.Length == 0) avatar = "m";
         if (avatar.Length > 2) avatar = avatar[..2];
@@ -80,7 +88,24 @@ public partial class AccountConfigWindow : Window
             tags.Add(tag.Length > 8 ? tag[..8] : tag);
         }
         account.Tags = tags;
+
+        // 代理拍生效值比较：内嵌账密的写法差异不影响 --proxy-server，无需重建环境
+        ProxyChanged = !string.Equals(
+            ProxyServerOf(oldProxy), ProxyServerOf(account.Proxy), StringComparison.OrdinalIgnoreCase);
+
+        Changed = ProxyChanged
+                  || oldAvatar != account.Avatar
+                  || oldName != account.Name
+                  || oldProxy != account.Proxy
+                  || oldTags != string.Join('\u0001', account.Tags);
     }
+
+    /// <summary>代理的生效值：忽略内嵌账密（账密走 407 挑战应答，不影响代理目标）。</summary>
+    private static string ProxyServerOf(string? proxy)
+    {
+        return string.IsNullOrWhiteSpace(proxy) ? "" : ProxyUtil.ProxyServerValue(proxy);
+    }
+
 
     // ---------- 代理测活 ----------
 
@@ -101,11 +126,12 @@ public partial class AccountConfigWindow : Window
         try
         {
             var normalized = ProxyUtil.Normalize(proxy);
+            var server = ProxyUtil.ProxyServerValue(proxy);
             bool ok;
             if (normalized.StartsWith("socks", StringComparison.OrdinalIgnoreCase))
             {
                 // .NET HttpClient 不支持 SOCKS：退化为端口连通性检测
-                var uri = new Uri(normalized);
+                var uri = new Uri(server);
                 ok = await Task.Run(() => TcpReachable(uri.Host, uri.Port, (int)TestTimeout.TotalMilliseconds));
                 var ms = sw.ElapsedMilliseconds;
                 TestStatus.Text = ok
@@ -116,7 +142,7 @@ public partial class AccountConfigWindow : Window
             {
                 using var handler = new HttpClientHandler
                 {
-                    Proxy = BuildWebProxy(normalized),
+                    Proxy = BuildWebProxy(server, normalized),
                     UseProxy = true,
                     AllowAutoRedirect = false,
                 };
@@ -136,8 +162,10 @@ public partial class AccountConfigWindow : Window
         }
         catch (Exception ex)
         {
-            var reason = ex.InnerException?.Message ?? ex.Message;
-            TestStatus.Text = Strings.ConfigProxyFail + reason;
+            // 逐层取 InnerException：HttpClient 常把真实原因（如 407）包在内层
+            var inner = ex;
+            while (inner.InnerException != null) inner = inner.InnerException;
+            TestStatus.Text = Strings.ConfigProxyFail + inner.Message;
         }
         finally
         {
@@ -146,11 +174,12 @@ public partial class AccountConfigWindow : Window
         }
     }
 
-    private static WebProxy BuildWebProxy(string normalized)
+    /// <summary>构建测试用 WebProxy；代理目标与原始地址分离，账密单独设置。</summary>
+    private static WebProxy BuildWebProxy(string server, string original)
     {
-        var uri = new Uri(normalized);
+        var uri = new Uri(server);
         var proxy = new WebProxy(uri.Host, uri.Port);
-        var creds = ProxyUtil.ParseProxyCreds(normalized);
+        var creds = ProxyUtil.ParseProxyCreds(original);
         if (creds != null) proxy.Credentials = new NetworkCredential(creds[0], creds[1]);
         return proxy;
     }
