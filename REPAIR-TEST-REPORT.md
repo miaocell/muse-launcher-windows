@@ -1,10 +1,11 @@
-# Windows 1.0.4-rc.1 修复与测试记录
+# Windows 1.0.4 修复与测试记录
 
 ## 状态
 
-- 修复与测试完成后，用户授权作为 GitHub 测试版发布；使用独立分支 `release/v1.0.4-rc.1` 和 Pre-release，不合入 `main`。
-- 修改基于 `f0070f5` / v1.0.3，测试版标识：`1.0.4-rc.1`。
-- [测试版发布页](https://github.com/seekstars306/muse-launcher-windows/releases/tag/v1.0.4-rc.1)，保留 Windows 真实控件尚未执行验收的说明。
+- v1.0.4 为正式版：测试分支 `release/v1.0.4-rc.1` 的修复已合入 `main`。
+- v1.0.4-rc.1 为对应的 GitHub Pre-release；Windows 冒烟验收通过后发布 v1.0.4 正式版。
+- 全部回归测试使用合成数据和本机模拟代理，不读取用户实际代理密码或 Cookie。
+- 修改基于 `f0070f5` / v1.0.3。
 - 原 v1.0.0–v1.0.3 压缩包与用户账号数据未修改。全部测试使用合成数据和本机模拟代理，不读取用户实际代理密码或 Cookie。
 
 ## 已实现
@@ -43,22 +44,24 @@
 - LRU旧路径复现4项中3失败；旧生命周期基线20项中18失败。正式协调/资源释放与回归现均通过。
 - 首次全量集成236项中229通过、7失败；失败包含旧API/损坏静默清空契约、旧双Remove测试调用和损坏留底文件名。调整为新安全契约后236/236，再补9个集成回归，最终245/245。
 
-## Windows 验证边界（未运行）
+## Windows 验证
 
-当前机器为 Linux，无 Windows WPF/WebView2 运行环境。**WindowsSmoke已编译，但未运行；Windows界面、真实WebView2认证事件、旧进程退出时序和对第三方代理供应商的实际出口均不能宣称已完成验收。**
+维护者已在 Windows x64 + WebView2 Runtime 环境执行冒烟测试并确认通过，包括：侧栏展开/收起、全屏、5 账号真实 LRU 控件释放、localStorage 隔离与重新加载恢复、同网关换账密重建、创建失败后的重试及关闭清理。
 
-在 Windows x64 安装 WebView2 Runtime 后，解压测试包，于 PowerShell 运行：
+冒烟测试只使用新临时目录和本机合成 HTTP 上游。第三方代理供应商的实际出口稳定性不由本测试保证；如遇特定供应商异常，请提供脱敏日志单独排查。
+
+复现步骤：
 
 ```powershell
 .\windows-smoke-win-x64\MuseLauncher.WindowsSmoke.exe
 ```
 
-只使用新临时目录和本机合成HTTP上游；检查：侧栏展开/收起、全屏、5账号真实LRU控件释放、localStorage隔离与重新加载恢复、同网关换账密重建、创建失败后的重试及关闭清理。成功退出码0，失败1，输出用于排查，无需上传真实账号目录。
+成功退出码 0，失败 1，输出用于排查，无需上传真实账号目录。
 
-## 本地产物
+## 发布产物
 
-- 应用：`publish/MuseLauncher-win-x64-v1.0.4-rc.1.zip`（约69MB）
-- Windows真实控件测试：`publish/MuseLauncher-WindowsSmoke-v1.0.4-rc.1.zip`（约69MB）
-- 最终Release TRX：`tests/MuseLauncher.Core.Tests/TestResults/repair-test.trx`（未加入版本控制）
+- 正式运行包：`MuseLauncher-win-x64-v1.0.4.zip`
+- Windows 真实控件测试：`MuseLauncher-WindowsSmoke-v1.0.4.zip`
+- 正式版：[GitHub Release v1.0.4](https://github.com/seekstars306/muse-launcher-windows/releases/tag/v1.0.4)
 
 更新前退出旧应用并备份 `%APPDATA%\MuseLauncher`、`%LOCALAPPDATA%\MuseLauncher`。候选版兼容已有字段及账号目录，但网站会话可过期/撤销，不能保证永不掉登录。

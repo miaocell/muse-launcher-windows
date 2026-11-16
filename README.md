@@ -2,13 +2,13 @@
 
 安卓版 [muse-launcher](https://github.com/seekstars306/muse-launcher) 的 Windows 版，基于 WPF + Microsoft Edge WebView2，直接加载 muse.ai 网页版。每个账号使用独立的用户数据目录，Cookie 和网页存储不共用。
 
-> **测试版 v1.0.4-rc.1**：[下载 Pre-release](https://github.com/seekstars306/muse-launcher-windows/releases/tag/v1.0.4-rc.1)。已通过 245 项核心与本机模拟代理回归测试；Windows WebView2 冒烟测试尚未实际运行，请勿当作稳定版。旧 v1.0.3 中“`--proxy-auth-scheme=basic` 可以提供 SOCKS5 账密认证”的说法有误；本测试版改用真实的本机协议桥接，不依赖该参数。
+> **v1.0.4**：[下载正式版](https://github.com/seekstars306/muse-launcher-windows/releases/tag/v1.0.4)。已通过 245 项核心与本机模拟代理回归测试，并由维护者在 Windows 上完成 WebView2 冒烟验收。旧 v1.0.3 中“`--proxy-auth-scheme=basic` 可以提供 SOCKS5 账密认证”的说法有误；v1.0.4 改用真实的本机协议桥接，不依赖该参数。
 
-## 测试版下载与运行
+## 下载与运行
 
-- [运行包：MuseLauncher-win-x64-v1.0.4-rc.1.zip](https://github.com/seekstars306/muse-launcher-windows/releases/download/v1.0.4-rc.1/MuseLauncher-win-x64-v1.0.4-rc.1.zip)
-- [Windows 冒烟测试包：MuseLauncher-WindowsSmoke-v1.0.4-rc.1.zip](https://github.com/seekstars306/muse-launcher-windows/releases/download/v1.0.4-rc.1/MuseLauncher-WindowsSmoke-v1.0.4-rc.1.zip)
-- 升级前退出旧版，并备份 `%APPDATA%\MuseLauncher` 和 `%LOCALAPPDATA%\MuseLauncher`；推荐把测试版解压到新目录运行。
+- [运行包：MuseLauncher-win-x64-v1.0.4.zip](https://github.com/seekstars306/muse-launcher-windows/releases/download/v1.0.4/MuseLauncher-win-x64-v1.0.4.zip)
+- [Windows 冒烟测试包：MuseLauncher-WindowsSmoke-v1.0.4.zip](https://github.com/seekstars306/muse-launcher-windows/releases/download/v1.0.4/MuseLauncher-WindowsSmoke-v1.0.4.zip)
+- 升级前退出旧版，并备份 `%APPDATA%\MuseLauncher` 和 `%LOCALAPPDATA%\MuseLauncher`。
 - 解压 Windows x64 自包含包，运行 `MuseLauncher.exe`；不需要单独安装 .NET，仍需要 Microsoft [WebView2 Evergreen Runtime](https://go.microsoft.com/fwlink/p/?LinkId=2124703)。
 - 添加账号后在 muse.ai 页面登录。服务端可能使会话失效，本程序不保证账号永不掉登录。
 - 左侧头像条和展开账号列表可切换账号；展开列表与网页左右并列，不覆盖 WebView2 原生窗口。
@@ -99,12 +99,12 @@ dotnet build MuseLauncher.sln -c Release
 dotnet run --project tests/MuseLauncher.WindowsSmoke -c Release
 ```
 
-入口只使用新临时目录、合成账号和本机模拟 HTTP 代理，不访问 muse.ai，也不使用真实代理密码。验证真实 WebView2 账号存储隔离、5 账号 LRU 控件释放、同网关换账密重建、创建失败与重试。未在 Windows 执行这个入口时，不应把“交叉编译通过”宣称为 GUI 或真实出口验证通过。
+入口只使用新临时目录、合成账号和本机模拟 HTTP 代理，不访问 muse.ai，也不使用真实代理密码。验证真实 WebView2 账号存储隔离、5 账号 LRU 控件释放、同网关换账密重建、创建失败与重试。Windows 维护者运行记录见 [REPAIR-TEST-REPORT.md](REPAIR-TEST-REPORT.md)。
 
-### 本地候选包
+### 本地构建包
 
 ```bash
-dotnet publish src/MuseLauncher -c Release -r win-x64 --self-contained true -o publish/candidate-win-x64
+dotnet publish src/MuseLauncher -c Release -r win-x64 --self-contained true -o publish/release-win-x64
 ```
 
 Windows `build.ps1` 执行测试后生成本地包，不负责 GitHub 提交或发布。应用不带在线更新器，退出后解压到新目录或覆盖程序文件更新；用户数据位于独立用户目录。
