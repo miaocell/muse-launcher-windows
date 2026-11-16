@@ -50,7 +50,7 @@ public static class Strings
     public const string ConfigName = "名称";
     public const string ConfigProxy = "代理";
     public const string ConfigProxyPh = "如 127.0.0.1:7890 或 socks5://127.0.0.1:1080";
-    public const string ConfigProxyHint = "留空则跟随系统网络，支持 http / https / socks5。保存后该账号的环境会立即按新代理重建（登录数据保留）。";
+    public const string ConfigProxyHint = "支持 HTTP / HTTPS / SOCKS5 上游认证，由每账号本机桥接处理。保存后重建环境，账号目录保留。";
     public const string ConfigProxyDetect = "探测";
     public const string ConfigProxyDetecting = "正在探测本机 Clash 端口…";
     public const string ConfigProxySaved = "已保存到账号";
@@ -73,8 +73,8 @@ public static class Strings
     public const string RuntimeNeedTitle = "需要安装 WebView2 运行时";
     public const string RuntimeNeedMsg =
         "本应用使用 Microsoft Edge WebView2 加载 muse.ai。\n" +
-        "当前系统未检测到 WebView2 运行时（Windows 10/11 一般自带，旧系统需单独安装）。\n\n" +
-        "点击「去安装」下载 Evergreen 运行时，安装完成后重新打开本应用。";
+        "未检测到 WebView2 运行时。\n\n" +
+        "点击确定打开官方安装入口，安装 Evergreen 运行时后重新打开本应用。";
     public const string RuntimeInstallBtn = "去安装";
     public const string BtnExit = "退出";
 }

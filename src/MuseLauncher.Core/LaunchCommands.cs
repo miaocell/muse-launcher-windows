@@ -48,47 +48,38 @@ public sealed class LaunchCommands
     /// <summary>release 构建（DEBUG == false）不响应任何调试参数。</summary>
     public static bool Enabled(bool debugBuild) => debugBuild;
 
-    /// <summary>从命令行参数解析（--key=value / --key value / 裸布尔开关）。</summary>
+    /// <summary>命令按键的类型解析，文本值不自动变成布尔或数字，也不吞下一个选项。</summary>
     public static LaunchCommands Parse(IReadOnlyList<string>? args)
     {
-        var e = new Dictionary<string, object>();
-        if (args != null)
+        var values = new Dictionary<string, object>();
+        var booleans = new HashSet<string>(FlagKeys) { "fullscreen" };
+        var identifiers = new HashSet<string> { "start_account", "open_config", "del_account" };
+        var strings = new HashSet<string> { "search_query", "proxy_preset" };
+        if (args == null) return new LaunchCommands(values);
+        for (var index = 0; index < args.Count; index++)
         {
-            for (var i = 0; i < args.Count; i++)
+            var argument = args[index];
+            if (string.IsNullOrEmpty(argument) || !argument.StartsWith('-')) continue;
+            var option = argument.StartsWith("--", StringComparison.Ordinal) ? argument[2..] : argument[1..];
+            var equals = option.IndexOf('=');
+            var key = equals < 0 ? option : option[..equals];
+            if (!booleans.Contains(key) && !identifiers.Contains(key) && !strings.Contains(key)) continue;
+            string? value = equals < 0 ? null : option[(equals + 1)..];
+            if (value == null && index + 1 < args.Count && !args[index + 1].StartsWith("-", StringComparison.Ordinal))
             {
-                var a = args[i];
-                if (string.IsNullOrWhiteSpace(a)) continue;
-                if (a.StartsWith("--")) a = a[2..];
-                else if (a.StartsWith('-')) a = a[1..];
-                var eq = a.IndexOf('=');
-                if (eq >= 0)
-                {
-                    e[a[..eq].Trim()] = ConvertValue(a[(eq + 1)..].Trim());
-                }
-                else if (FlagKeys.Contains(a))
-                {
-                    e[a] = true;
-                }
-                else if (i + 1 < args.Count)
-                {
-                    e[a.Trim()] = ConvertValue(args[++i].Trim());
-                }
-                else
-                {
-                    e[a] = true;
-                }
+                var next = args[index + 1];
+                if (!booleans.Contains(key) || bool.TryParse(next, out _)) { value = next; index++; }
             }
+            if (booleans.Contains(key))
+                values[key] = value == null || bool.TryParse(value, out var flag) && flag;
+            else if (identifiers.Contains(key))
+                values[key] = long.TryParse(value, System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture, out var id) && id > 0 ? id : -1L;
+            else if (value != null) values[key] = value;
         }
-        return new LaunchCommands(e);
+        return new LaunchCommands(values);
     }
 
-    /// <summary>命令行值只有字符串一种形态，先转成 bool/long 再入库；其余保留字符串。</summary>
-    private static object ConvertValue(string s)
-    {
-        if (bool.TryParse(s, out var b)) return b;
-        if (long.TryParse(s, out var l)) return l;
-        return s;
-    }
 
     /// <summary>供单元测试：直接从键值表构造（模拟安卓 parse(Map)）。</summary>
     public static LaunchCommands Parse(Dictionary<string, object> extras)

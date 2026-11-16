@@ -1,173 +1,140 @@
 namespace MuseLauncher.Core;
 
-/// <summary>
-/// 账号元数据持久化。各账号的登录数据由 WebView2 用户数据目录负责持久化。
-///
-/// 防损设计（与安卓版一致）：
-/// - 每次成功保存前，把上一次的 list 值滚动备份到 list_prev；
-/// - list 解析失败时：原始值留底到 list_corrupt（可人工找回），并尝试从 list_prev 自愈；
-/// - 单条账号数据损坏只跳过该条，不影响其余；
-/// - loadNotice 通过 TakeLoadNotice() 上抛给 UI 提示用户。
-/// </summary>
-public class AccountsStore
+/// <summary>保存候选成功后才发布账号快照，ID 不复用，文件损坏不能静默当作首次运行。</summary>
+public sealed class AccountsStore
 {
     private readonly object gate = new();
     private readonly IKeyValueStore prefs;
-    private readonly List<Account> accounts = new();
+    private readonly Func<long, bool> isIdReserved;
+    private List<Account> accounts = new();
     private long nextId = 1;
     private long currentId = -1;
     private string? loadNotice;
 
-    public AccountsStore(IKeyValueStore store)
+    public AccountsStore(IKeyValueStore store, Func<long, bool>? isIdReserved = null)
     {
         prefs = store;
+        this.isIdReserved = isIdReserved ?? (_ => false);
         Load();
     }
 
-    public void Reload()
-    {
-        lock (gate) Load();
-    }
+    public void Reload() { lock (gate) Load(); }
 
     private void Load()
     {
-        loadNotice = null;
-        accounts.Clear();
-        var parsed = AccountJsonCodec.FromJsonOrNull(prefs.GetString("list", "[]"));
+        var notice = (prefs as IStoreLoadNotice)?.TakeLoadNotice();
+        var raw = prefs.GetString("list", "[]");
+        var parsed = AccountJsonCodec.FromJsonOrNull(raw, out var skipped);
         if (parsed == null)
         {
-            var raw = prefs.GetString("list", "");
-            if (!string.IsNullOrEmpty(raw) && raw != "[]")
+            var backup = AccountJsonCodec.FromJsonOrNull(prefs.GetString("list_prev", null), out skipped);
+            if (backup == null) throw new StoreLoadException("账号列表与历史备份均无法解析，停止修改账号数据");
+            var values = new Dictionary<string, object?>
             {
-                // 原始数据留底，避免被后续保存彻底覆盖，人工可找回
-                prefs.PutString("list_corrupt", raw);
-                loadNotice = "corrupt";
-            }
-            // 尝试从上一次保存前的备份自愈
-            var recovered = AccountJsonCodec.FromJsonOrNull(prefs.GetString("list_prev", null));
-            if (recovered != null && recovered.Count > 0)
-            {
-                accounts.AddRange(recovered);
-                loadNotice = "recovered";
-                // 只写回 list 主键。此时 nextId/currentId 还没从磁盘读入，
-                // 绝不能走完整 Save()（会用字段默认值 nextId=1 覆盖真实值，造成 id 冲突）
-                var json = AccountJsonCodec.ToJson(accounts);
-                if (json != null) prefs.PutString("list", json);
-            }
+                ["list"] = AccountJsonCodec.ToJson(backup),
+                ["list_corrupt"] = raw,
+            };
+            prefs.PutAll(values);
+            parsed = backup;
+            notice = "recovered";
         }
-        else
+        if (skipped)
         {
-            accounts.AddRange(parsed);
+            prefs.PutString("list_corrupt", raw);
+            notice ??= "corrupt";
         }
-        nextId = prefs.GetLong("nextId", 1);
-        currentId = prefs.GetLong("currentId", -1);
-        if (accounts.Count == 0)
-        {
-            currentId = -1;
-        }
-        else if (FindById(currentId) == null)
-        {
-            currentId = accounts[0].Id;
-        }
+        var persistedNext = prefs.GetLong("nextId", 1);
+        var largest = parsed.Count == 0 ? 0 : parsed.Max(account => account.Id);
+        if (largest == long.MaxValue) throw new StoreLoadException("账号 ID 已到上限，无法安全分配新环境");
+        var correctedNext = Math.Max(largest + 1, Math.Max(1, persistedNext));
+        if (correctedNext != persistedNext) notice ??= "corrupt";
+        var loadedCurrent = prefs.GetLong("currentId", -1);
+        if (!parsed.Any(account => account.Id == loadedCurrent)) loadedCurrent = parsed.Count == 0 ? -1 : parsed[0].Id;
+        accounts = parsed;
+        nextId = correctedNext;
+        currentId = loadedCurrent;
+        loadNotice = notice;
     }
 
-    public void Save()
+    private void Persist(List<Account> candidate, long candidateNext, long candidateCurrent)
     {
-        try
+        var json = AccountJsonCodec.ToJson(candidate) ?? throw new InvalidDataException("账号序列化失败");
+        var values = new Dictionary<string, object?>
         {
-            var json = AccountJsonCodec.ToJson(accounts);
-            if (json == null) return; // 序列化异常：跳过本次写盘，保留旧数据
-            var vals = new Dictionary<string, object?>();
-            var prevList = prefs.GetString("list", null);
-            if (prevList != null) vals["list_prev"] = prevList; // 滚动备份
-            vals["list"] = json;
-            vals["nextId"] = nextId;
-            vals["currentId"] = currentId;
-            prefs.PutAll(vals);
-        }
-        catch
-        {
-            // 写盘失败保留旧数据
-        }
+            ["list"] = json,
+            ["nextId"] = candidateNext,
+            ["currentId"] = candidateCurrent,
+        };
+        var previous = prefs.GetString("list", null);
+        if (AccountJsonCodec.FromJsonOrNull(previous) != null) values["list_prev"] = previous;
+        prefs.PutAll(values);
+        accounts = candidate;
+        nextId = candidateNext;
+        currentId = candidateCurrent;
     }
 
-    /// <summary>
-    /// 取走本次加载的结果提示：null=正常，"recovered"=已从备份自愈，"corrupt"=损坏已留底。
-    /// 取走后清空，避免重复提示。
-    /// </summary>
+    public void Save() { lock (gate) Persist(accounts.Select(account => account.Clone()).ToList(), nextId, currentId); }
     public string? TakeLoadNotice()
     {
         lock (gate)
         {
-            var n = loadNotice;
+            var notice = loadNotice;
             loadNotice = null;
-            return n;
+            return notice;
         }
     }
+    public IReadOnlyList<Account> All() { lock (gate) return accounts.Select(account => account.Clone()).ToArray(); }
+    public Account? FindById(long id) { lock (gate) return accounts.FirstOrDefault(account => account.Id == id)?.Clone(); }
+    public long GetCurrentId() { lock (gate) return currentId; }
 
-    public IReadOnlyList<Account> All()
-    {
-        lock (gate) return accounts;
-    }
+    public Account AddDefault() => AddDefault(null);
 
-    public Account? FindById(long id)
+    public Account AddDefault(string? inheritProxy, bool inheritForceProxy = false)
     {
         lock (gate)
         {
-            foreach (var a in accounts)
+            var id = nextId;
+            while (accounts.Any(account => account.Id == id) || isIdReserved(id))
             {
-                if (a.Id == id) return a;
+                if (id == long.MaxValue) throw new InvalidOperationException("账号 ID 已耗尽");
+                id = checked(id + 1);
             }
-            return null;
+            if (id == long.MaxValue) throw new InvalidOperationException("账号 ID 已耗尽");
+            var added = new Account(id, "Muse " + id)
+            {
+                Proxy = inheritProxy ?? "",
+                ForceProxy = inheritForceProxy,
+            };
+            var candidate = accounts.Select(account => account.Clone()).ToList();
+            candidate.Add(added);
+            Persist(candidate, checked(id + 1), id);
+            return added.Clone();
         }
     }
 
-    public long GetCurrentId()
+    public void Update(Account updated)
     {
-        lock (gate) return currentId;
-    }
-
-    /// <summary>新建账号，默认名 "Muse N"（N 与账号 id 一致）。</summary>
-    public Account AddDefault()
-    {
+        ArgumentNullException.ThrowIfNull(updated);
         lock (gate)
         {
-            var a = new Account(nextId, "Muse " + nextId);
-            nextId++;
-            accounts.Add(a);
-            currentId = a.Id;
-            Save();
-            return a;
+            var candidate = accounts.Select(account => account.Clone()).ToList();
+            var index = candidate.FindIndex(account => account.Id == updated.Id);
+            if (index < 0) throw new InvalidOperationException("账号已不存在");
+            var replacement = updated.Clone();
+            replacement.Logged = candidate[index].Logged;
+            candidate[index] = replacement;
+            Persist(candidate, nextId, currentId);
         }
-    }
-
-    /// <summary>
-    /// 新建账号并继承指定代理（国内直连 muse.ai 不通，新环境沿用可用网络路径），返回新账号。
-    /// </summary>
-    public Account AddDefault(string? inheritProxy)
-    {
-        var a = AddDefault();
-        if (!string.IsNullOrEmpty(inheritProxy))
-        {
-            lock (gate)
-            {
-                a.Proxy = inheritProxy;
-                Save();
-            }
-        }
-        return a;
     }
 
     public void Rename(long id, string name)
     {
         lock (gate)
         {
-            var a = FindById(id);
-            if (a != null)
-            {
-                a.Name = name;
-                Save();
-            }
+            var account = FindById(id);
+            if (account == null) return;
+            account.Name = name;
+            Update(account);
         }
     }
 
@@ -175,13 +142,10 @@ public class AccountsStore
     {
         lock (gate)
         {
-            var a = FindById(id);
-            if (a != null) accounts.Remove(a);
-            if (currentId == id)
-            {
-                currentId = accounts.Count == 0 ? -1 : accounts[0].Id;
-            }
-            Save();
+            if (!accounts.Any(account => account.Id == id)) return;
+            var candidate = accounts.Where(account => account.Id != id).Select(account => account.Clone()).ToList();
+            var selected = currentId == id ? candidate.FirstOrDefault()?.Id ?? -1 : currentId;
+            Persist(candidate, nextId, selected);
         }
     }
 
@@ -189,20 +153,22 @@ public class AccountsStore
     {
         lock (gate)
         {
-            if (currentId == id) return; // 无变化不写盘
-            currentId = id;
-            // 与安卓一致：只写 currentId 独立键，不全量序列化账号列表（切换零开销）
+            if (!accounts.Any(account => account.Id == id)) throw new ArgumentOutOfRangeException(nameof(id));
+            if (id == currentId) return;
             prefs.PutLong("currentId", id);
+            currentId = id;
         }
     }
 
-    public bool IsFullscreen()
+    public void SetLogged(long id, bool logged)
     {
-        lock (gate) return prefs.GetBoolean("fullscreen", false);
+        lock (gate)
+        {
+            var account = accounts.FirstOrDefault(account => account.Id == id);
+            if (account != null) account.Logged = logged;
+        }
     }
 
-    public void SetFullscreen(bool v)
-    {
-        lock (gate) prefs.PutBoolean("fullscreen", v);
-    }
+    public bool IsFullscreen() { lock (gate) return prefs.GetBoolean("fullscreen", false); }
+    public void SetFullscreen(bool value) { lock (gate) prefs.PutBoolean("fullscreen", value); }
 }

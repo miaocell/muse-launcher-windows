@@ -3,96 +3,81 @@ using System.Text.Json;
 
 namespace MuseLauncher.Core;
 
-/// <summary>
-/// 账号列表 JSON 编解码。读取对损坏数据有容错：
-/// 顶层不是 JSON 数组返回 null（由调用方走备份恢复），单条损坏只跳过该条。
-/// </summary>
+/// <summary>兼容旧账号数组，严格校验正数/唯一 ID，单条损坏留给调用方提示。</summary>
 public static class AccountJsonCodec
 {
     private static readonly JsonSerializerOptions WriteOptions = new()
     {
-        // 中文/emoji 原样输出，accounts.json 便于人工查看
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
     };
 
-    /// <summary>序列化失败（理论上不会发生）返回 null，调用方应跳过本次写盘以保留旧数据</summary>
     public static string? ToJson(IReadOnlyList<Account> accounts)
     {
-        try
+        var ids = new HashSet<long>();
+        var output = new List<Dictionary<string, object?>>();
+        foreach (var account in accounts)
         {
-            var arr = new List<Dictionary<string, object?>>(accounts.Count);
-            foreach (var a in accounts)
+            if (account.Id <= 0 || !ids.Add(account.Id) || string.IsNullOrWhiteSpace(account.Name))
+                throw new InvalidDataException("账号 ID 或名称无效，未保存");
+            output.Add(new Dictionary<string, object?>
             {
-                arr.Add(new Dictionary<string, object?>
-                {
-                    ["id"] = a.Id,
-                    ["name"] = a.Name,
-                    ["avatar"] = a.Avatar,
-                    ["proxy"] = a.Proxy,
-                    ["forceProxy"] = a.ForceProxy,
-                    ["tags"] = a.Tags,
-                });
-            }
-            return JsonSerializer.Serialize(arr, WriteOptions);
+                ["id"] = account.Id,
+                ["name"] = account.Name,
+                ["avatar"] = account.Avatar,
+                ["proxy"] = account.Proxy,
+                ["forceProxy"] = account.ForceProxy,
+                ["tags"] = account.Tags,
+            });
         }
-        catch
-        {
-            return null;
-        }
+        return JsonSerializer.Serialize(output, WriteOptions);
     }
 
-    /// <summary>
-    /// 解析账号列表。
-    /// 顶层不是合法 JSON 数组时返回 null（由调用方走备份恢复）；
-    /// 数组合法但某一条目字段损坏时跳过该条目，其余照常返回。
-    /// </summary>
-    public static List<Account>? FromJsonOrNull(string? raw)
-    {
-        if (raw == null) return null;
-        JsonDocument doc;
-        try
-        {
-            doc = JsonDocument.Parse(raw);
-        }
-        catch
-        {
-            return null;
-        }
+    public static List<Account>? FromJsonOrNull(string? raw) => FromJsonOrNull(raw, out _);
 
-        using (doc)
+    public static List<Account>? FromJsonOrNull(string? raw, out bool skippedEntries)
+    {
+        skippedEntries = false;
+        if (raw == null) return null;
+        JsonDocument document;
+        try { document = JsonDocument.Parse(raw); }
+        catch (JsonException) { return null; }
+        using (document)
         {
-            if (doc.RootElement.ValueKind != JsonValueKind.Array) return null;
-            var output = new List<Account>();
-            foreach (var el in doc.RootElement.EnumerateArray())
+            if (document.RootElement.ValueKind != JsonValueKind.Array) return null;
+            var result = new List<Account>();
+            var ids = new HashSet<long>();
+            foreach (var item in document.RootElement.EnumerateArray())
             {
                 try
                 {
-                    long id = el.GetProperty("id").GetInt64();
-                    string name = el.GetProperty("name").GetString()
-                        ?? throw new JsonException();
-                    var a = new Account(id, name);
-                    if (el.TryGetProperty("avatar", out var avatar) && avatar.ValueKind == JsonValueKind.String)
-                        a.Avatar = avatar.GetString() ?? "m";
-                    if (el.TryGetProperty("proxy", out var proxy) && proxy.ValueKind == JsonValueKind.String)
-                        a.Proxy = proxy.GetString() ?? "";
-                    if (el.TryGetProperty("forceProxy", out var fp) && fp.ValueKind is JsonValueKind.True)
-                        a.ForceProxy = true;
-                    if (el.TryGetProperty("tags", out var tags) && tags.ValueKind == JsonValueKind.Array)
+                    var id = item.GetProperty("id").GetInt64();
+                    var name = item.GetProperty("name").GetString();
+                    if (id <= 0 || string.IsNullOrWhiteSpace(name) || !ids.Add(id))
                     {
-                        foreach (var t in tags.EnumerateArray())
-                        {
-                            var s = t.GetString();
-                            if (!string.IsNullOrEmpty(s)) a.Tags.Add(s);
-                        }
+                        skippedEntries = true;
+                        continue;
                     }
-                    output.Add(a);
+                    var account = new Account(id, name);
+                    if (item.TryGetProperty("avatar", out var avatar) && avatar.ValueKind == JsonValueKind.String)
+                        account.Avatar = avatar.GetString() ?? "m";
+                    if (item.TryGetProperty("proxy", out var proxy) && proxy.ValueKind == JsonValueKind.String)
+                        account.Proxy = proxy.GetString() ?? "";
+                    if (item.TryGetProperty("forceProxy", out var force) && force.ValueKind == JsonValueKind.True)
+                        account.ForceProxy = true;
+                    if (item.TryGetProperty("tags", out var tags) && tags.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var tag in tags.EnumerateArray())
+                            if (tag.ValueKind == JsonValueKind.String && !string.IsNullOrEmpty(tag.GetString()))
+                                account.Tags.Add(tag.GetString()!);
+                    }
+                    result.Add(account);
                 }
-                catch
+                catch (Exception ex) when (ex is JsonException or InvalidOperationException or KeyNotFoundException or FormatException)
                 {
-                    // 单条损坏不影响其余条目
+                    skippedEntries = true;
                 }
             }
-            return output;
+            return result;
         }
     }
 }

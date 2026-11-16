@@ -1,9 +1,9 @@
 namespace MuseLauncher.Core;
 
 /// <summary>
-/// 按账号 id 保存重资源的注册表（WebView 等），带 LRU 容量上限：
-/// TouchAndEvict 把指定 id 标记为最近使用，超过容量时从最旧开始驱逐。
-/// 与安卓版逐行对齐；驱逐决策与资源销毁（WPF 侧）解耦。
+/// 按账号保存资源并维护 LRU 顺序。注册表只转移资源所有权，不负责 Dispose；
+/// 重资源调用方应使用返回实例的 API，而不是根据已移除的 id 再查找资源。
+/// 本类本身不保证线程安全。
 /// </summary>
 public class LruAccountRegistry<T> where T : class
 {
@@ -14,18 +14,25 @@ public class LruAccountRegistry<T> where T : class
 
     public LruAccountRegistry(int maxAlive)
     {
-        this.maxAlive = Math.Max(1, maxAlive);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxAlive, 1);
+        this.maxAlive = maxAlive;
     }
 
+    /// <summary>取得实例并刷新最近使用顺序。</summary>
     public T? Get(long id)
     {
-        if (!map.TryGetValue(id, out var v)) return null;
-        MoveToNewest(id);
-        return v;
+        var value = Peek(id);
+        if (value != null) MoveToNewest(id);
+        return value;
     }
 
+    /// <summary>只检查登记，不刷新 LRU；适用于事件来源的身份校验。</summary>
+    public T? Peek(long id) => map.GetValueOrDefault(id);
+
+    /// <summary>登记/刷新资源。替换已有实例之前，调用方负责取走并销毁旧实例。</summary>
     public void Put(long id, T value)
     {
+        ArgumentNullException.ThrowIfNull(value);
         if (map.ContainsKey(id))
         {
             map[id] = value;
@@ -42,45 +49,54 @@ public class LruAccountRegistry<T> where T : class
 
     public T? Remove(long id)
     {
-        if (!map.TryGetValue(id, out var v)) return null;
-        map.Remove(id);
+        if (!map.Remove(id, out var value)) return null;
         if (nodes.Remove(id, out var node)) order.Remove(node);
-        return v;
+        return value;
+    }
+
+    /// <summary>移除最旧的非保护资源，直接把实例所有权交给调用方。</summary>
+    public (long Id, T Value)? RemoveOldest(IReadOnlySet<long>? excludedIds = null)
+    {
+        for (var node = order.First; node != null; node = node.Next)
+        {
+            if (excludedIds?.Contains(node.Value) == true) continue;
+            var id = node.Value;
+            return (id, Remove(id)!);
+        }
+        return null;
     }
 
     public bool Contains(long id) => map.ContainsKey(id);
-
     public int Size => map.Count;
 
-    /// <summary>副本，供遍历时安全使用（例如在 WPF 侧做可见性切换 / 崩溃匹配）。</summary>
+    /// <summary>独立副本；遍历和身份检查不改变最近使用顺序。</summary>
     public IReadOnlyDictionary<long, T> Snapshot() => new Dictionary<long, T>(map);
 
     /// <summary>
-    /// 放入（或刷新）id 对应的资源并标记为最近使用；若总量超出 maxAlive，
-    /// 从最久未用的开始返回应驱逐的 id。返回列表永远不包含 id 本身。
+    /// 兼容旧调用方的决策 API：返回的 id 已被移除，不能再通过 Remove 获取实例。
+    /// WebView 等重资源必须使用 TouchAndEvictEntries 或 RemoveOldest。
     /// </summary>
-    public List<long> TouchAndEvict(long id, T value)
+    public List<long> TouchAndEvict(long id, T value) =>
+        TouchAndEvictEntries(id, value).Select(entry => entry.Id).ToList();
+
+    /// <summary>登记并驱逐超容量资源；返回已移除的实际实例，供调用方逐个销毁。</summary>
+    public List<(long Id, T Value)> TouchAndEvictEntries(long id, T value)
     {
-        Put(id, value); // put 同时刷新为最新
-        var evict = new List<long>();
+        Put(id, value);
+        var evicted = new List<(long Id, T Value)>();
         while (map.Count > maxAlive)
         {
-            var eldest = order.First;
-            if (eldest == null) break;
-            if (eldest.Value == id) break; // 理论不可达（刚 put 的 id 最新），防御性保护
-            evict.Add(eldest.Value);
-            Remove(eldest.Value);
+            var entry = RemoveOldest();
+            if (entry == null) break;
+            evicted.Add(entry.Value);
         }
-        return evict;
+        return evicted;
     }
 
     private void MoveToNewest(long id)
     {
-        if (nodes.Remove(id, out var node))
-        {
-            order.Remove(node);
-            order.AddLast(node);
-            nodes[id] = node;
-        }
+        if (!nodes.TryGetValue(id, out var node)) return;
+        order.Remove(node);
+        order.AddLast(node);
     }
 }

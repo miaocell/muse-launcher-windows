@@ -20,10 +20,7 @@ public class Account
     /// <summary>代理地址，空 = 跟随系统网络</summary>
     public string Proxy { get; set; } = "";
 
-    /// <summary>
-    /// 强制所有流量走代理（含本机地址），防止 bypass 规则导致真实 IP 泄露。
-    /// 仅在有代理时生效。
-    /// </summary>
+    /// <summary>取消浏览器的本机地址代理绕过；不是系统级防直连。</summary>
     public bool ForceProxy { get; set; }
 
     /// <summary>标签（侧栏可按标签搜索）</summary>
@@ -31,4 +28,13 @@ public class Account
 
     /// <summary>登录态：运行时从 Cookie 探测，不持久化</summary>
     public bool Logged { get; set; }
+
+    public Account Clone() => new(Id, Name)
+    {
+        Avatar = Avatar,
+        Proxy = Proxy,
+        ForceProxy = ForceProxy,
+        Tags = new List<string>(Tags),
+        Logged = Logged,
+    };
 }

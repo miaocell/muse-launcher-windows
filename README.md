@@ -1,126 +1,138 @@
 # Muse 登录器 for Windows
 
-安卓版 [muse-launcher](https://github.com/seekstars306/muse-launcher) 的 Windows 版：一个
-**多账户 muse.ai 启动器**。基于 WPF + Microsoft Edge WebView2（Chromium 内核），
-直接加载网页版 muse.ai，每个账号一个完全隔离的浏览器环境。
+安卓版 [muse-launcher](https://github.com/seekstars306/muse-launcher) 的 Windows 版，基于 WPF + Microsoft Edge WebView2，直接加载 muse.ai 网页版。每个账号使用独立的用户数据目录，Cookie 和网页存储不共用。
 
-## 原理
+> **测试版 v1.0.4-rc.1**：[下载 Pre-release](https://github.com/seekstars306/muse-launcher-windows/releases/tag/v1.0.4-rc.1)。已通过 245 项核心与本机模拟代理回归测试；Windows WebView2 冒烟测试尚未实际运行，请勿当作稳定版。旧 v1.0.3 中“`--proxy-auth-scheme=basic` 可以提供 SOCKS5 账密认证”的说法有误；本测试版改用真实的本机协议桥接，不依赖该参数。
 
-与安卓版用 WebView Profile 隔离的做法一一对应：
+## 测试版下载与运行
 
-| | 安卓版 | Windows 版 |
+- [运行包：MuseLauncher-win-x64-v1.0.4-rc.1.zip](https://github.com/seekstars306/muse-launcher-windows/releases/download/v1.0.4-rc.1/MuseLauncher-win-x64-v1.0.4-rc.1.zip)
+- [Windows 冒烟测试包：MuseLauncher-WindowsSmoke-v1.0.4-rc.1.zip](https://github.com/seekstars306/muse-launcher-windows/releases/download/v1.0.4-rc.1/MuseLauncher-WindowsSmoke-v1.0.4-rc.1.zip)
+- 升级前退出旧版，并备份 `%APPDATA%\MuseLauncher` 和 `%LOCALAPPDATA%\MuseLauncher`；推荐把测试版解压到新目录运行。
+- 解压 Windows x64 自包含包，运行 `MuseLauncher.exe`；不需要单独安装 .NET，仍需要 Microsoft [WebView2 Evergreen Runtime](https://go.microsoft.com/fwlink/p/?LinkId=2124703)。
+- 添加账号后在 muse.ai 页面登录。服务端可能使会话失效，本程序不保证账号永不掉登录。
+- 左侧头像条和展开账号列表可切换账号；展开列表与网页左右并列，不覆盖 WebView2 原生窗口。
+- 设置可修改名称、头像、标签及代理；保存采用草稿，失败时不污染正在使用的配置。
+- 搜索按名称和标签过滤。`F11` 切换全屏；`Esc` 收起列表或退出全屏。
+- 默认最多保留 4 个浏览器会话。淘汰会真实销毁控件和代理隧道，但保留账号目录，切回时重新加载。
+- 删除账号会先等待其浏览器释放、保存列表，再删除对应目录；目录被占用时明确提示并保留，不会悄悄拿给新账号。
+
+## 每账号不同代理
+
+每个有代理的账号拥有单独的本机监听端口和单独的上游配置：
+
+```text
+账号 A 的 WebView2 → 127.0.0.1:随机端口 A → 上游代理 A
+账号 B 的 WebView2 → 127.0.0.1:随机端口 B → 上游代理 B
+```
+
+本机桥接只接受带随机本机会话认证的请求，只连接配置的上游代理，不在上游失败后改为直连。服务商账密只由桥接向上游提交，不会作为浏览器启动参数，也不会用于普通网站认证。
+
+### 输入格式
+
+| 协议 | 示例 | 认证 |
 |---|---|---|
-| 账号隔离 | androidx WebView Profile（`acct_N`） | 每账号独立 WebView2 UserDataFolder + 独立浏览器进程 |
-| 常驻上限 | LRU 保留最近 4 个 WebView | LRU 保留最近 4 个 WebView2（驱逐仅丢页面，磁盘登录态保留） |
-| 代理 | ProxyController 切号时全局切换 | 每账号环境创建参数 `--proxy-server`，真正按账号生效 |
-| 账号数据 | SharedPreferences `list/list_prev` 自愈 | `%APPDATA%\MuseLauncher\accounts.json` 同款自愈 |
-| 登录探测 | 全量 CookieManager 探测 `hatch_sess` | 活动 webview 实时探测；未活动账号尽力读磁盘 Cookies 库 |
+| HTTP | `http://user:password@gateway.example:8000` | Basic 上游代理认证；无账密也可 |
+| HTTPS 代理 | `https://user:password@gateway.example:443` | 先验证上游 TLS 证书，再认证/CONNECT |
+| SOCKS5 | `socks5://user:password@gateway.example:1080` | 桥接实现 SOCKS5/RFC 1929 username/password；无认证也可 |
+| 本机 HTTP | `127.0.0.1:7897` | 默认补 HTTP 协议 |
 
-## 安装运行
+- 密码中的 `@`、`/`、`#` 等 URI 特殊字符需要百分号编码，例如 `p@ss:word` 写为 `p%40ss%3Aword`。
+- 只接受代理端点，不接受路径、query、fragment、控制字符、不合法端口；不支持 SOCKS4、Digest/NTLM 上游代理认证。
+- 同网关换密码、国家或 session 用户名也会更新环境，不能继续使用旧认证缓存和隧道。
+- 测活与浏览器使用同一个桥接实现，验证代理协议、认证和目标 HTTPS 请求，不把“TCP 端口开放”误报为认证通过。
+- 本机端口探测只表示找到监听端口；支持探测 7890、7897、7891、7892，之后仍需测活确认。
 
-1. 解压 `MuseLauncher-win-x64-v1.0.0.zip`（自包含，无需安装 .NET）；
-2. 双击 `MuseLauncher.exe`；
-3. 若提示缺少 WebView2 运行时（Windows 10/11 一般自带），点「去安装」下载
-   [Evergreen 运行时](https://go.microsoft.com/fwlink/p/?LinkId=2124703)，装完重开。
+### 保存与重建
 
-**系统要求**：Windows 10 1803+ / Windows 11，x64。
+WebView2 的代理参数在浏览器环境启动时指定。配置变化后，本程序先销毁旧环境并等待旧浏览器进程退出，再在原账号目录创建新环境。等待超时会显示错误并提供重试，不强行杀进程、不清除登录数据。
 
-## 使用
+账号代理留空表示跟随系统网络；已有 Clash 系统代理/TUN 也可能影响流量路由。为不同账号分配不同出口时，应为每个账号明确填写各自上游，并核对供应商的实际出口行为。
 
-- **添加账号**：左侧窄条 `＋` 或展开列表底部的「添加 Muse 账号」；新账号**自动继承当前账号的代理**（国内直连 muse.ai 不通）。
-- **登录**：第一次进入某个账号会打开 muse.ai 首页，登录一次后该账号的登录态持久保留（数据在各自目录，互不串）。
-- **切换**：左侧头像列或抽屉列表点击即切换；绿点 = 已登录。
-- **重命名 / 删除 / 配置**：账号行右侧三个小按钮；删除会连磁盘环境一起清除。
-- **代理配置**：账号配置页支持 http/https/socks5 地址、「测活」（gstatic generate_204）、
-  「探测」（自动探测本机 Clash 7890/7891/7892 端口）。修改代理后重新进入该账号生效。
-- **搜索**：抽屉顶部搜索框按 名称+标签 过滤。
-- **全屏**：`F11` 进入/退出，`Esc` 也可退出；状态会记住。
+### 代理绕过控制的边界
 
-## 调试参数（仅 Debug 构建）
+配置页的“取消浏览器本机地址的代理绕过”保留旧 `ForceProxy` 字段，作用是取消 Chromium 的 loopback bypass。启用该选项却没有有效代理会明确报错，不默认转为直连。
 
-镜像安卓 am start extras，改为命令行参数：
+**它不是 VPN、系统防火墙或全流量 kill switch**，不保证 WebRTC/UDP、其他软件及系统服务走该代理。HTTP Basic 和 SOCKS5 的账密本身不加密；远程不可信网络优先选择支持 TLS 的 HTTPS 代理。
+
+## 数据和恢复
+
+| 数据 | 位置 |
+|---|---|
+| 账号配置 | `%APPDATA%\MuseLauncher\accounts.json` |
+| 文件级滚动备份 | 同目录 `accounts.json.bak` |
+| 损坏文件留底 | 同目录独立的带时间/随机标识文件 |
+| 每账号 Cookie、网页存储 | `%LOCALAPPDATA%\MuseLauncher\Profiles\acct_N\` |
+| 运行日志 | `%LOCALAPPDATA%\MuseLauncher\log.txt` |
+
+兼容旧账号 JSON 字段及 `acct_N` 目录。加载时会校验正数、唯一 ID 并修复陈旧计数，新分配 ID 避开已存在的账号目录。完整文件损坏且没有可恢复备份时停止启动并保留原文件，不当作首次运行。
+
+文件写入成功后才发布内存状态；磁盘满、权限或文件锁错误会报告，不能显示虚假的保存成功。备份仍不等于保险，请在升级前退出程序并备份上述用户目录。账号文件中的代理账密仍是本地明文，注意文件权限，不要上传完整配置或用户目录。
+
+登录点只认 muse.ai 的 `hatch_sess` 名称，活动环境由 CookieManager 探测；未活动账号用不池化的独立 SQLite 快照，按域、路径和有效期筛选。无数据、未知会话或读取失败保持未知，不读取 cookie 值。
+
+## 测试与构建
+
+需要 .NET 8 SDK。Linux/macOS 可以交叉编译 WPF，但不能运行 Windows WebView2 控件。
+
+```bash
+dotnet restore MuseLauncher.sln
+dotnet test tests/MuseLauncher.Core.Tests -c Release
+dotnet build MuseLauncher.sln -c Debug
+dotnet build MuseLauncher.sln -c Release
+```
+
+核心测试使用合成数据和 loopback 模拟服务，覆盖：
+
+- HTTP CONNECT/407、HTTPS 代理 TLS、SOCKS5 真实认证成功/拒绝；
+- 本机认证、Header 剥离、双向数据、WebSocket/分块响应、超时与停止清理；
+- 两账号不同上游与凭证、上游失败不改直连、特殊字符账密；
+- 真正的文件读写/备份/故障注入、ID 校验、账号草稿保存；
+- 实际假资源 Dispose、容量预算、乱序完成、修改配置/删除/关闭、旧事件和展示代次；
+- 登录数据库快照、精确域与有效期、参数安全编解码。
+
+### Windows WebView2 冒烟测试
+
+在 Windows 及 WebView2 Runtime 环境下运行：
+
+```powershell
+dotnet run --project tests/MuseLauncher.WindowsSmoke -c Release
+```
+
+入口只使用新临时目录、合成账号和本机模拟 HTTP 代理，不访问 muse.ai，也不使用真实代理密码。验证真实 WebView2 账号存储隔离、5 账号 LRU 控件释放、同网关换账密重建、创建失败与重试。未在 Windows 执行这个入口时，不应把“交叉编译通过”宣称为 GUI 或真实出口验证通过。
+
+### 本地候选包
+
+```bash
+dotnet publish src/MuseLauncher -c Release -r win-x64 --self-contained true -o publish/candidate-win-x64
+```
+
+Windows `build.ps1` 执行测试后生成本地包，不负责 GitHub 提交或发布。应用不带在线更新器，退出后解压到新目录或覆盖程序文件更新；用户数据位于独立用户目录。
+
+## Debug 参数
+
+仅 Debug 构建启用 `--start_account=N`、`--add_account`、`--del_account=N`、`--show_drawer`、`--open_config=N`、`--search_query=文本`、`--fullscreen=true|false`、`--dump_auth`。
 
 ```bash
 dotnet run --project src/MuseLauncher -- --start_account=2 --show_drawer
 ```
 
-支持：`--start_account=N` `--add_account` `--del_account=N` `--dump_auth`
-`--show_drawer` `--open_config=N` `--search_query=xx` `--fullscreen=true|false`
-`--proxy_preset=xxx [--proxy_autotest] [--proxy_save]`。第二次启动的参数会转发给已运行的实例。
-`--dump_auth` 会把各账号 cookie 名与 localStorage 键输出到日志文件。
+第二次启动通过当前 Windows 用户隔离、限长度的 JSON 命名管道转发参数。诊断只记录 cookie 名与存储键，不写 cookie 值。Release 不响应调试操作。不要从不可信脚本传入删除账号等参数。
 
-## 数据位置
+## 隐私和限制
 
-| 内容 | 路径 |
-|---|---|
-| 账号列表 | `%APPDATA%\MuseLauncher\accounts.json`（损坏自动从 `list_prev` 自愈，原始值留底 `list_corrupt`） |
-| 每账号登录数据 | `%LOCALAPPDATA%\MuseLauncher\Profiles\acct_N\` |
-| 运行日志 | `%LOCALAPPDATA%\MuseLauncher\log.txt`（MusePerf / MuseAuth / MuseWebview，与安卓 logcat tag 对应） |
-
-## 从源码构建
-
-```bash
-# 任意平台（Linux/macOS 需 .NET 8 SDK，靠 EnableWindowsTargeting 交叉构建）
-dotnet test tests/MuseLauncher.Core.Tests
-dotnet publish src/MuseLauncher -c Release -r win-x64 --self-contained true -o publish/win-x64
-```
-
-Windows 上也可以直接跑 `build.ps1`（测试 + 发布 + 打 zip）。
-
-## 与安卓版的已知差异
-
-1. **登录绿点**：未活动的账号（被 LRU 驱逐后）用读磁盘 Cookies 库的方式尽力探测，失败则保留上次状态；安卓可全量实时探测。
-2. **下载**：使用 WebView2 自带下载 UI（安卓走 DownloadManager）；UA 为桌面 Edge，无需安卓的去 `; wv` 处理。
-3. **内存**：LRU 常驻 4 个账号 = 4 个浏览器进程，空闲内存高于安卓。
-4. **鉴权代理**：`--proxy-server` 本身不支持 URL 内嵌账密，本应用会自动剥离账密、改由 WebView2 的 `BasicAuthenticationRequested`（407 挑战）应答，因此 `http://user:pass@host:port` 写法同样可用。
-
-## ⚠️ 代理为什么有时"看似没生效"
-
-WebView2 / Chromium 的代理只能在**浏览器进程启动时**通过 `--proxy-server` 指定，**没有运行时切换 API**。本应用因此在「保存代理后会销毁并重建该账号的浏览器环境」——如果你改了代理但页面没变化，请确认：
-
-1. 是在**账号配置页**改的，并点了**保存**（不是只在测活框里改了）；
-2. 保存后该账号会短暂显示切换过渡层（环境重建中），重建完成后才走新代理；
-3. 代理端口要填完整（如 `127.0.0.1:7897`），可点「探测」自动识别本机 Clash 端口。
-
-> 顺带一提：若 Clash 开了 TUN / 系统代理模式，全系统流量本就已走代理，此时账号内留空也能正常访问。
-
-## 🌐 多账号分代理（含 1024proxy 等带账密住宅代理）
-
-每个账号都有**独立的浏览器进程和独立的 `--proxy-server`**，因此可以做到「账号 A 走美国 IP、账号 B 走日本 IP」，互不干扰。这是比安卓版更彻底的隔离方式（安卓的 `ProxyController` 是应用级开关，同一时刻只能有一个代理生效）。
-
-### 支持的写法
-
-| 类型 | 示例 |
-|---|---|
-| HTTP 代理（无账密） | `127.0.0.1:7897` |
-| HTTP 代理（带账密） | `http://用户名:密码@gate.example.com:8000` |
-| SOCKS5（带账密） | `socks5://用户名:密码@gate.example.com:1080` |
-| HTTPS 代理 | `https://用户名:密码@gate.example.com:443` |
-
-### 实现细节
-
-- **账密不会出现在进程命令行**：应用会自动把 `user:pass@` 从 `--proxy-server` 中剥离（Chromium 不接受内嵌账密，原样传入会导致代理静默失效），只传 `scheme://host:port`；
-- **HTTP 代理鉴权**：通过 WebView2 的 `BasicAuthenticationRequested`（407 挑战）应答，并校验挑战来源 host 与代理 host 一致，避免把代理账密交给普通网站；
-- **SOCKS5 鉴权**：SOCKS5 不使用 407，额外附加 `--proxy-auth-scheme=basic` 由内核直接完成握手；
-- **强制走代理**：配置页可勾选「强制所有流量走此代理」，附加 `--proxy-bypass-list=<-loopback>` 取消 Chromium 默认的本机直连豁免，避免真实 IP 泄露。
-
-### 使用步骤
-
-1. 选中账号 → 点账号行的「设置」图标打开账号配置；
-2. 填入该账号专属的代理地址 → 点「测活」确认连通；
-3. 按需勾选「强制所有流量走此代理」；
-4. 点「保存」——环境会自动按新代理重建（登录数据保留，不会掉登录）；
-5. 对其他账号重复上述步骤，填入不同代理即可实现出口 IP 隔离。
+- 本程序是网页启动器，不是反检测、指纹隔离或服务条款规避工具。
+- 它不保证供应商 IP 固定、账号永不掉登录、网页功能永久兼容或全流量防泄漏。
+- 只有用户主动设置的代理和网页目标会参与请求；测活主动访问 gstatic 的 HTTPS 测试端点。
+- 运行日志不包含代理密码或 cookie 值；仍应在分享日志前检查个人信息。
+- 与 muse.ai 官方无关，请遵守目标服务条款及当地法律法规。
 
 ---
 
 ## 🔗 友情链接
 
-- [LINUX DO](https://linux.do/) —— 真诚分享、友好讨论的技术社区，本项目的交流与反馈也发布于此
-
----
+- [LINUX DO](https://linux.do/) —— 真诚分享、友好讨论的技术社区。
 
 ## 🔗 相关链接
 
-- [Muse Launcher 安卓版](https://github.com/seekstars306/muse-launcher) —— 对应的 Android WebView Profile 多账号启动器
-
+- [Muse Launcher 安卓版](https://github.com/seekstars306/muse-launcher) —— Android WebView Profile 多账号启动器。

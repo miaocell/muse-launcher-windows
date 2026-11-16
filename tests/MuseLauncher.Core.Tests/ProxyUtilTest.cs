@@ -14,7 +14,7 @@ public class ProxyUtilTest
     {
         Assert.Equal("http://127.0.0.1:7890", ProxyUtil.Normalize("127.0.0.1:7890"));
         Assert.Equal("socks5://127.0.0.1:1080", ProxyUtil.Normalize("socks5://127.0.0.1:1080"));
-        Assert.Equal("http://user:p@1.2.3.4:3129", ProxyUtil.Normalize("user:p@1.2.3.4:3129"));
+        Assert.Equal("http://1.2.3.4:3129", ProxyUtil.Normalize("user:p@1.2.3.4:3129"));
     }
 
     [Fact]
@@ -50,14 +50,14 @@ public class ProxyUtilTest
         Assert.DoesNotContain(args, a => a.Contains("u:") || a.Contains(":p@"));
     }
 
+    /// <summary>A missing host is invalid; it must not silently choose the system network.</summary>
     [Fact]
     public void ProxyServerValue_HandlesEdgeCases()
     {
         Assert.Equal("http://1.2.3.4:3129", ProxyUtil.ProxyServerValue("http://u:p@1.2.3.4:3129"));
         Assert.Equal("http://1.2.3.4:3129", ProxyUtil.ProxyServerValue("u:p@1.2.3.4:3129"));
         Assert.Equal("http://127.0.0.1:7890", ProxyUtil.ProxyServerValue("127.0.0.1:7890"));
-        // 只有账密没有主机（异常输入）不应抛异常
-        Assert.Equal("", ProxyUtil.ProxyServerValue("u:p@"));
+        Assert.Throws<FormatException>(() => ProxyUtil.ProxyServerValue("u:p@"));
     }
 
     [Fact]
@@ -66,7 +66,7 @@ public class ProxyUtilTest
         Assert.Equal(new[] { "user", "pass" }, ProxyUtil.ParseProxyCreds("http://user:pass@1.2.3.4:3129"));
         Assert.Equal(new[] { "user", "" }, ProxyUtil.ParseProxyCreds("http://user@1.2.3.4:3129"));
         Assert.Null(ProxyUtil.ParseProxyCreds("http://1.2.3.4:3129"));
-        Assert.Null(ProxyUtil.ParseProxyCreds("http://@1.2.3.4:3129"));
+        Assert.Throws<FormatException>(() => ProxyUtil.ParseProxyCreds("http://@1.2.3.4:3129"));
     }
 
     [Fact]
@@ -96,13 +96,13 @@ public class ProxyUtilTest
 
     // ---------- 1024proxy 一类带账密的住宅代理 ----------
 
-    /// <summary>带账密的代理必须附加 basic 认证方案，否则 Chromium 407 会反复重试。</summary>
+    /// <summary>Authentication is implemented by the local bridge, not a fictitious Chromium switch.</summary>
     [Fact]
-    public void BrowserArgs_WithCredentials_AddsBasicAuthScheme()
+    public void BrowserArgs_WithCredentials_NoFictitiousAuthScheme()
     {
         var args = ProxyUtil.BrowserArgsFor("http://user:pass@1.2.3.4:3129");
         Assert.Contains("--proxy-server=http://1.2.3.4:3129", args);
-        Assert.Contains("--proxy-auth-scheme=basic", args);
+        Assert.DoesNotContain("--proxy-auth-scheme=basic", args);
     }
 
     [Fact]
@@ -114,11 +114,11 @@ public class ProxyUtilTest
     }
 
     [Fact]
-    public void BrowserArgs_Socks5WithCredentials_AddsAuthScheme()
+    public void BrowserArgs_Socks5WithCredentials_NoFictitiousAuthScheme()
     {
         var args = ProxyUtil.BrowserArgsFor("socks5://user:pass@gate.1024proxy.io:1080");
         Assert.Contains("--proxy-server=socks5://gate.1024proxy.io:1080", args);
-        Assert.Contains("--proxy-auth-scheme=basic", args);
+        Assert.DoesNotContain("--proxy-auth-scheme=basic", args);
     }
 
     /// <summary>强制走代理时用 &lt;-loopback&gt; 取消本机直连豁免，避免真实 IP 泄露。</summary>
@@ -136,19 +136,18 @@ public class ProxyUtilTest
         Assert.DoesNotContain("--proxy-bypass-list=<-loopback>", args);
     }
 
-    /// <summary>空代理即便勾了强制也不应生成任何参数（没有代理可走）。</summary>
+    /// <summary>ForceProxy without an endpoint must fail closed.</summary>
     [Fact]
-    public void BrowserArgs_EmptyProxy_ForceStillNoArgs()
+    public void BrowserArgs_EmptyProxy_ForceFailsClosed()
     {
-        Assert.Empty(ProxyUtil.BrowserArgsFor("", forceProxy: true));
-        Assert.Empty(ProxyUtil.BrowserArgsFor(null, forceProxy: true));
+        Assert.Throws<FormatException>(() => ProxyUtil.BrowserArgsFor("", forceProxy: true));
+        Assert.Throws<FormatException>(() => ProxyUtil.BrowserArgsFor(null, forceProxy: true));
     }
 
-    /// <summary>只有账密没有主机属于无效输入，不应生成残缺的 --proxy-server。</summary>
     [Fact]
-    public void BrowserArgs_CredentialsOnly_NoArgs()
+    public void BrowserArgs_CredentialsOnly_Invalid()
     {
-        Assert.Empty(ProxyUtil.BrowserArgsFor("http://user:pass@"));
+        Assert.Throws<FormatException>(() => ProxyUtil.BrowserArgsFor("http://user:pass@"));
     }
 
     [Theory]

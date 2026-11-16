@@ -1,855 +1,652 @@
+using System.ComponentModel;
+using System.Globalization;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
-using System.Windows.Media.Animation;
 using System.Windows.Threading;
-using Microsoft.Web.WebView2.Wpf;
 using MuseLauncher.Core;
 
 namespace MuseLauncher;
 
-/// <summary>
-/// 主窗口：左侧窄条 + 抽屉账号列表 + 主区网页容器。
-/// 行为与安卓版 MainActivity 对齐（LRU 常驻、错误遮罩重试、splash 过渡、登录态探测等）。
-/// </summary>
+/// <summary>窗口管理展示状态；协调器统一拥有创建中和常驻会话，实际释放淘汰资源。</summary>
 public partial class MainWindow : Window
 {
-    private const int MaxAliveWebviews = 4;      // LRU：最多同时保留的账号页面数（含当前）
-    private const double MinSplashMs = 500;
-    private const double SplashTimeoutMs = 8000;
-    private const double SplashLoadedHideMs = 450;
-
+    private const int MaxAliveWebviews = 4;
+    private const int MinSplashMs = 500;
+    private const int SplashTimeoutMs = 8000;
     private readonly AccountsStore store;
-    private readonly LruAccountRegistry<AccountWebHost> webViews = new(MaxAliveWebviews);
-    private readonly Dictionary<long, bool> webLoaded = new();
-    private readonly Dictionary<long, bool> webErrored = new();
-    private readonly Dictionary<long, long> loadStartAt = new();
-    private readonly Dictionary<long, Task<AccountWebHost?>> creatingTasks = new();
-    private AccountWebHost? currentWebView;
-
+    private readonly SessionCoordinator<AccountWebHost, BrowserSessionConfiguration> sessions;
+    private readonly BrowserViewState viewState = new();
+    private readonly CancellationTokenSource lifetime = new();
+    private readonly HashSet<long> changingAccounts = new();
+    private readonly Dictionary<long, int> recoveryAttempts = new();
+    private readonly string profilesRoot;
+    private readonly string startUrl;
+    private readonly DispatcherTimer toastTimer;
+    private CancellationTokenSource? transition;
+    private long splashShownAt;
     private long editId = -1;
     private long confirmDelId = -1;
-    private long splashShownAt;
     private bool fullscreen;
     private WindowState preFullscreenState = WindowState.Normal;
     private bool probingDisk;
     private bool probeDiskDirty;
+    private bool closing;
+    private bool closed;
+    private TextBox? renameInput;
 
-    private DispatcherTimer? splashLoadedTimer;
-    private DispatcherTimer? splashFallbackTimer;
-    private DispatcherTimer? splashMinDelayTimer;
-    private DispatcherTimer? toastTimer;
+    public MainWindow() : this(null, null, AccountWebHost.StartUrl) { }
 
-    public MainWindow()
+    internal MainWindow(string? dataDirectory, string? profilesDirectory, string initialUrl)
     {
+        profilesRoot = Path.GetFullPath(profilesDirectory ?? AccountWebHost.ProfilesRoot);
+        startUrl = initialUrl;
         InitializeComponent();
-
-        var appDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "MuseLauncher");
-        store = new AccountsStore(new FileKeyValueStore(Path.Combine(appDir, "accounts.json")));
-        CheckStoreNotice();
-
-        var cur = store.GetCurrentId();
-        if (cur < 0 || store.FindById(cur) == null)
+        var appDir = dataDirectory ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MuseLauncher");
+        store = new AccountsStore(new FileKeyValueStore(Path.Combine(appDir, "accounts.json")),
+            id => Directory.Exists(ProfilePath(id)));
+        sessions = new SessionCoordinator<AccountWebHost, BrowserSessionConfiguration>(MaxAliveWebviews,
+            CreateWebViewAsync, host => host.DisposeAsync().AsTask());
+        toastTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2.2) };
+        toastTimer.Tick += (_, _) => { toastTimer.Stop(); ToastPopup.IsOpen = false; };
+        Closing += OnClosing;
+        Activated += (_, _) => ProbeNonAliveSoon();
+        Deactivated += (_, _) => { toastTimer.Stop(); ToastPopup.IsOpen = false; };
+        Loaded += async (_, _) =>
         {
-            if (store.All().Count == 0)
-            {
-                RenderAccounts();
-            }
-            else
-            {
-                _ = SwitchTo(store.All()[0].Id, animate: false);
-            }
-        }
-        else
-        {
-            _ = SwitchTo(cur, animate: false);
-        }
-
-        if (store.IsFullscreen()) EnterFullscreen();
-
-        ProbeNonAliveSoon();
-
-        Closing += (_, _) =>
-        {
-            foreach (var host in webViews.Snapshot().Values) host.Dispose();
+            CheckStoreNotice();
+            RenderAccounts();
+            if (store.IsFullscreen()) ApplyFullscreen(true);
+            var current = store.GetCurrentId();
+            if (current > 0 && viewState.AccountId == null) await SwitchTo(current, animate: true);
+            ProbeNonAliveSoon();
         };
     }
 
-    private static long Tick() => Environment.TickCount64;
+    internal AccountsStore Accounts => store;
+    internal IReadOnlyDictionary<long, AccountWebHost> HostedSessions => sessions.Snapshot();
+    internal int HostedControlCount => WebContainer.Children.Count;
+    internal BrowserViewState DisplayState => viewState;
+    internal Task ActivateAccountAsync(long id) => SwitchTo(id, animate: true);
 
-    /// <summary>账号存储损坏/自愈提示（takeLoadNotice 取走即清，不重复弹）。</summary>
+    private string ProfilePath(long id)
+    {
+        if (id <= 0) throw new ArgumentOutOfRangeException(nameof(id));
+        return Path.Combine(profilesRoot, "acct_" + id);
+    }
+
     private void CheckStoreNotice()
     {
-        var n = store.TakeLoadNotice();
-        if (n == "recovered")
-        {
-            Toast(Strings.ToastStoreRecovered);
-        }
-        else if (n == "corrupt")
-        {
-            Toast(Strings.ToastStoreCorrupt);
-        }
+        var notice = store.TakeLoadNotice();
+        if (notice == "recovered") Toast("账号数据已从备份恢复，请核对配置");
+        else if (notice == "corrupt") Toast("已跳过损坏或重复的账号记录，请核对账号列表");
     }
 
-    // ---------- 调试/自动化命令（仅 Debug 构建，对应安卓 am start extras） ----------
-
-    public void HandleLaunchCommands(string[] args)
+    public async void HandleLaunchCommands(string[] args)
     {
 #if DEBUG
-        if (!LaunchCommands.Enabled(debugBuild: true)) return;
-        var cmd = LaunchCommands.Parse(args);
-        if (cmd.StartAccount >= 0 && store.FindById(cmd.StartAccount) != null)
-        {
-            _ = SwitchTo(cmd.StartAccount, animate: true);
-        }
-        if (cmd.HasFullscreen)
-        {
-            if (cmd.Fullscreen) EnterFullscreen();
-            else ExitFullscreen();
-        }
-        if (cmd.ShowDrawer) OpenDrawer();
-        if (cmd.HasOpenConfig)
-        {
-            var cfgId = cmd.OpenConfigId >= 0 ? cmd.OpenConfigId : store.GetCurrentId();
-            if (cfgId >= 0) OpenConfig(cfgId);
-        }
-        if (cmd.SearchQuery != null)
-        {
-            OpenDrawer();
-            SearchInput.Text = cmd.SearchQuery;
-        }
-        if (cmd.DumpAuth) DumpAuthState();
-        if (cmd.AddAccount) AddAccount();
-        if (cmd.HasDelAccount && cmd.DelAccountId >= 0 && store.FindById(cmd.DelAccountId) != null)
-        {
-            DeleteAccount(cmd.DelAccountId);
-        }
-#endif
-    }
-
-    private void DumpAuthState()
-    {
-#if DEBUG
-        DumpAuthStateCore();
-#endif
-    }
-
-#if DEBUG
-    private async void DumpAuthStateCore()
-    {
-        foreach (var a in store.All())
-        {
-            var host = webViews.Get(a.Id);
-            if (host != null)
-            {
-                try
-                {
-                    var names = await host.GetMuseCookieNamesAsync();
-                    Log.I("MuseAuth", $"acct={a.Id} name={a.Name} cookies=[{string.Join(' ', names)}]");
-                    var js = await host.EvalAuthStateAsync();
-                    Log.I("MuseAuth", $"acct={a.Id} js={js}");
-                }
-                catch (Exception ex)
-                {
-                    Log.I("MuseAuth", $"acct={a.Id} err={ex.Message}");
-                }
-            }
-            else
-            {
-                var names = AuthProbe.ProbeCookieNamesOnDisk(a.Id);
-                Log.I("MuseAuth", $"acct={a.Id} name={a.Name} cookies=" + (names == null
-                    ? "null"
-                    : "[" + string.Join(' ', names) + "]") + " (disk)");
-            }
-        }
-        Toast("已输出登录态到日志：" + Log.FilePath);
-    }
-#endif
-
-    // ---------- 全屏模式 ----------
-
-    private void EnterFullscreen()
-    {
-        if (fullscreen) return;
-        fullscreen = true;
-        store.SetFullscreen(true);
-        SidebarCol.Width = new GridLength(0);
-        Rail.Visibility = Visibility.Collapsed;
-        DrawerContent.Visibility = Visibility.Collapsed;
-        preFullscreenState = WindowState;
-        WindowStyle = WindowStyle.None;
-        WindowState = WindowState.Maximized;
-    }
-
-    private void ExitFullscreen()
-    {
-        if (!fullscreen) return;
-        fullscreen = false;
-        store.SetFullscreen(false);
-        SidebarCol.Width = new GridLength(56);
-        Rail.Visibility = Visibility.Visible;
-        DrawerContent.Visibility = Visibility.Collapsed;
-        WindowStyle = WindowStyle.SingleBorderWindow;
-        WindowState = preFullscreenState;
-    }
-
-    // ---------- WebView（每账号独立实例） ----------
-
-    private Task<AccountWebHost?> GetOrCreateAsync(Account a)
-    {
-        var existing = webViews.Get(a.Id);
-        if (existing != null) return Task.FromResult<AccountWebHost?>(existing);
-        if (!creatingTasks.TryGetValue(a.Id, out var t))
-        {
-            t = CreateWebViewAsync(a);
-            creatingTasks[a.Id] = t;
-            _ = t.ContinueWith(
-                _ => creatingTasks.Remove(a.Id),
-                TaskScheduler.FromCurrentSynchronizationContext());
-        }
-        return t;
-    }
-
-    private async Task<AccountWebHost?> CreateWebViewAsync(Account a)
-    {
-        loadStartAt[a.Id] = Tick();
-        Log.I("MusePerf", $"load start id={a.Id}");
+        if (closing) return;
         try
         {
-            // 先把控件挂进可视化树再异步初始化，确保底层 HWND 有父窗口
-            var host = await AccountWebHost.CreateAsync(a, wv => WebContainer.Children.Add(wv));
-            if (store.FindById(a.Id) == null)
+            var command = LaunchCommands.Parse(args);
+            if (command.StartAccount > 0) await SwitchTo(command.StartAccount, animate: true);
+            if (command.HasFullscreen) SetFullscreen(command.Fullscreen);
+            if (command.ShowDrawer) OpenDrawer();
+            if (command.SearchQuery != null) { OpenDrawer(); SearchInput.Text = command.SearchQuery; }
+            if (command.HasOpenConfig)
             {
-                // 创建期间账号被删除
-                host.Dispose();
-                return null;
+                var id = command.OpenConfigId > 0 ? command.OpenConfigId : store.GetCurrentId();
+                await OpenConfigAsync(id);
             }
-            host.LoadStartAt = loadStartAt[a.Id];
-            host.NavigationStarting += h => webErrored[h.AccountId] = false;
-            host.NavigationCompleted += OnNavigationCompleted;
-            host.RendererFailed += OnRendererFailed;
-            host.SetVisible(false);
-            webViews.Put(a.Id, host);
-
-            // LRU 驱逐超出上限的旧账号页面（磁盘数据保留，仅页面状态丢弃）
-            foreach (var evictedId in webViews.TouchAndEvict(a.Id, host))
-            {
-                EvictWebView(evictedId);
-            }
-            return host;
+            if (command.AddAccount) await AddAccountAsync();
+            if (command.HasDelAccount && command.DelAccountId > 0) await DeleteAccountAsync(command.DelAccountId);
+            if (command.DumpAuth) await DumpAuthStateAsync();
         }
-        catch (Exception ex)
+        catch (Exception ex) { ReportOperationFailure("调试命令执行失败", ex); }
+#else
+        await Task.CompletedTask;
+#endif
+    }
+
+#if DEBUG
+    private async Task DumpAuthStateAsync()
+    {
+        foreach (var account in store.All())
         {
-            loadStartAt.Remove(a.Id);
-            Log.I("MusePerf", $"load error id={a.Id} desc={ex.Message}");
-            if (store.GetCurrentId() == a.Id)
+            if (!sessions.Snapshot().TryGetValue(account.Id, out var host)) continue;
+            try
             {
-                ShowErrorOverlay("创建浏览器环境失败：" + ex.Message);
+                var names = await host.GetMuseCookieNamesAsync();
+                var keys = await host.EvalAuthStateAsync();
+                Log.I("MuseAuth", $"acct={account.Id} cookieNames=[{string.Join(' ', names)}] keys={keys}");
             }
-            return null;
+            catch (Exception ex) { Log.I("MuseAuth", $"acct={account.Id} unavailable={ex.GetType().Name}"); }
+        }
+        Toast("已输出 cookie 名与存储键，不含 cookie 值：" + Log.FilePath);
+    }
+#endif
+
+    private void SetFullscreen(bool value)
+    {
+        if (fullscreen == value || closing) return;
+        try { store.SetFullscreen(value); ApplyFullscreen(value); }
+        catch (Exception ex) { ReportOperationFailure("未能保存全屏设置", ex); }
+    }
+
+    private void ApplyFullscreen(bool value)
+    {
+        fullscreen = value;
+        SidebarCol.Width = new GridLength(value ? 0 : 56);
+        Rail.Visibility = value ? Visibility.Collapsed : Visibility.Visible;
+        DrawerContent.Visibility = Visibility.Collapsed;
+        if (value)
+        {
+            preFullscreenState = WindowState;
+            WindowStyle = WindowStyle.None;
+            WindowState = WindowState.Maximized;
+        }
+        else
+        {
+            WindowStyle = WindowStyle.SingleBorderWindow;
+            WindowState = preFullscreenState;
         }
     }
 
-    private void EvictWebView(long id)
+    private async Task<AccountWebHost> CreateWebViewAsync(
+        long id, BrowserSessionConfiguration configuration, CancellationToken cancellationToken)
     {
-        var old = webViews.Remove(id);
-        if (old == null) return;
-        webLoaded.Remove(id);
-        webErrored.Remove(id);
-        loadStartAt.Remove(id);
-        if (currentWebView == old) currentWebView = null;
-        WebContainer.Children.Remove(old.Control);
-        old.Dispose();
-        Log.I("MuseWebview", $"lru evict id={id}");
+        var host = await AccountWebHost.CreateAsync(id, configuration,
+            control => WebContainer.Children.Add(control), cancellationToken);
+        host.NavigationStarting += OnNavigationStarting;
+        host.NavigationCompleted += OnNavigationCompleted;
+        host.RendererFailed += OnRendererFailed;
+        return host;
     }
 
-    private void OnNavigationCompleted(AccountWebHost host, bool isSuccess, string? errorText)
+    private void RefreshVisibleState()
     {
-        var id = host.AccountId;
-        webLoaded[id] = true;
-        if (loadStartAt.TryGetValue(id, out var st))
+        var current = sessions.Current;
+        foreach (var entry in sessions.Snapshot())
         {
-            Log.I("MusePerf", $"load end id={id} cost={Tick() - st}ms errored={!isSuccess}");
-            loadStartAt.Remove(id);
+            var show = viewState.CanShowWebView && viewState.AccountId == entry.Key
+                && ReferenceEquals(current, entry.Value) && sessions.IsCurrent(entry.Key, entry.Value);
+            entry.Value.SetVisible(show);
         }
-        if (!isSuccess)
+        Splash.Visibility = viewState.SplashVisible ? Visibility.Visible : Visibility.Collapsed;
+        ErrorOverlay.Visibility = viewState.Error != null ? Visibility.Visible : Visibility.Collapsed;
+        ErrorMsg.Text = viewState.Error ?? "";
+    }
+
+    private void OnNavigationStarting(AccountWebHost host)
+    {
+        if (!sessions.IsCurrent(host.AccountId, host) || closing) return;
+        viewState.SetError(host.AccountId, viewState.Version, null);
+        RefreshVisibleState();
+    }
+
+    private void OnNavigationCompleted(AccountWebHost host, bool success, string? error)
+    {
+        if (!sessions.IsRegistered(host.AccountId, host) || closing) return;
+        if (success) recoveryAttempts.Remove(host.AccountId);
+        if (sessions.IsCurrent(host.AccountId, host))
         {
-            webErrored[id] = true;
-        }
-        if (store.GetCurrentId() == id)
-        {
-            if (webErrored.GetValueOrDefault(id))
-            {
-                ShowErrorOverlay(errorText ?? Strings.ErrorGeneric); // 错误页已渲染，保持遮罩等用户重试
-            }
-            else
-            {
-                HideErrorOverlay();
-            }
-            HideSplashAfterMinDelay();
+            var version = viewState.Version;
+            viewState.SetError(host.AccountId, version, success ? null : error ?? Strings.ErrorGeneric);
+            if (success) _ = HideSplashAfterDelayAsync(host.AccountId, version,
+                Math.Max(0, MinSplashMs - (Environment.TickCount64 - splashShownAt)));
+            RefreshVisibleState();
         }
         _ = ProbeAliveAsync(host);
     }
 
-    private void OnRendererFailed(AccountWebHost host)
+    private async void OnRendererFailed(AccountWebHost host)
     {
-        // 渲染进程崩溃：销毁并重建该账号的 WebView；磁盘数据不受影响，登录态保留
-        var id = host.AccountId;
-        var wasCurrent = currentWebView == host;
-        webViews.Remove(id);
-        webLoaded.Remove(id);
-        webErrored.Remove(id);
-        loadStartAt.Remove(id);
-        if (currentWebView == host) currentWebView = null;
-        WebContainer.Children.Remove(host.Control);
-        host.Dispose();
-
-        if (wasCurrent && store.FindById(id) != null)
+        if (closing || !sessions.IsRegistered(host.AccountId, host)) return;
+        var wasCurrent = sessions.IsCurrent(host.AccountId, host);
+        var version = viewState.Version;
+        try
         {
-            Toast(Strings.ToastWebviewRecovered);
-            _ = SwitchTo(id, animate: false);
+            if (!await sessions.InvalidateAsync(host.AccountId, host)) return;
+            if (!wasCurrent || !viewState.Matches(host.AccountId, version) || closing) return;
+            var attempts = recoveryAttempts.GetValueOrDefault(host.AccountId) + 1;
+            recoveryAttempts[host.AccountId] = attempts;
+            if (attempts > 2)
+            {
+                viewState.SetError(host.AccountId, version, "浏览器连续退出，请检查环境后点击重试");
+                RefreshVisibleState();
+                return;
+            }
+            Toast("浏览器异常，正在重建该账号环境");
+            await SwitchTo(host.AccountId, animate: true);
+        }
+        catch (Exception ex)
+        {
+            if (viewState.Matches(host.AccountId, version))
+            {
+                viewState.SetError(host.AccountId, version, "环境释放失败，请稍后重试或重新打开启动器");
+                RefreshVisibleState();
+            }
+            ReportOperationFailure("浏览器恢复失败", ex);
         }
     }
 
-    private void ShowErrorOverlay(string msg)
+    private async Task SwitchTo(long id, bool animate, bool reload = false)
     {
-        ErrorMsg.Text = string.IsNullOrEmpty(msg) ? Strings.ErrorGeneric : msg;
-        ErrorOverlay.Visibility = Visibility.Visible;
-        currentWebView?.SetVisible(false);
-    }
+        if (closing || changingAccounts.Contains(id)) return;
+        var account = store.FindById(id);
+        if (account == null) return;
+        try { store.SetCurrent(id); }
+        catch (Exception ex) { ReportOperationFailure("未能保存当前账号", ex); return; }
 
-    private void HideErrorOverlay()
-    {
-        ErrorOverlay.Visibility = Visibility.Collapsed;
-        currentWebView?.SetVisible(true);
-    }
-
-    // ---------- 账号操作 ----------
-
-    private async void AddAccount()
-    {
-        // 新环境继承当前账号的代理：国内直连 muse.ai 不通，空代理的新环境必然卡在加载
-        var prev = store.FindById(store.GetCurrentId());
-        var a = store.AddDefault(prev?.Proxy);
-        editId = -1;
-        confirmDelId = -1;
-        await SwitchTo(a.Id, animate: true);
-        Toast(string.Format(Strings.ToastCreatedFmt, a.Name));
-    }
-
-    private async Task SwitchTo(long id, bool animate)
-    {
-        var a = store.FindById(id);
-        if (a == null) return;
-        store.SetCurrent(id);
+        transition?.Cancel();
+        transition?.Dispose();
+        transition = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        var version = viewState.Begin(id, showSplash: true);
+        splashShownAt = Environment.TickCount64;
+        SplashName.Text = account.Name;
+        SplashTile.Text = account.Avatar;
         RenderAccounts();
-        HideErrorOverlay();
-
-        if (animate) ShowSplashFor(a);
-
-        var host = await GetOrCreateAsync(a);
-        if (host == null) return;           // 创建失败：错误遮罩已显示
-        if (store.GetCurrentId() != id) return; // 等待期间用户已切走
-
-        foreach (var kv in webViews.Snapshot())
+        RefreshVisibleState();
+        _ = HideSplashAfterDelayAsync(id, version, SplashTimeoutMs);
+        try
         {
-            kv.Value.SetVisible(kv.Key == id);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(transition.Token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(45));
+            var host = await sessions.ActivateAsync(id,
+                new BrowserSessionConfiguration(account.Proxy, account.ForceProxy, ProfilePath(id)), timeout.Token);
+            if (!viewState.Matches(id, version) || closing) return;
+            if (host == null)
+            {
+                viewState.SetError(id, version, "环境创建已取消或超时，请重试");
+                RefreshVisibleState();
+                return;
+            }
+            viewState.BindHost(id, version);
+            viewState.SetError(id, version, null);
+            RefreshVisibleState();
+            if (!host.HasNavigated) host.Navigate(startUrl);
+            else if (host.Errored || reload) host.Reload();
+            else _ = HideSplashAfterDelayAsync(id, version,
+                animate ? Math.Max(0, MinSplashMs - (Environment.TickCount64 - splashShownAt)) : 0);
+            _ = ProbeAliveAsync(host);
         }
-        currentWebView = host;
-
-        // 目标页面若处于错误态：自动重新加载，避免停留在无法恢复的错误页
-        if (webErrored.GetValueOrDefault(id))
+        catch (Exception ex)
         {
-            webErrored[id] = false;
-            loadStartAt[id] = Tick();
-            Log.I("MusePerf", $"load reload-on-switch id={id}");
-            host.Reload();
+            if (viewState.Matches(id, version))
+            {
+                viewState.SetError(id, version, ex is FormatException ? ex.Message
+                    : "创建浏览器环境失败。请检查代理或等待旧浏览器退出后重试。");
+                RefreshVisibleState();
+            }
+            Log.I("MuseWebview", $"creation failed id={id} type={ex.GetType().Name}");
         }
+    }
+
+    private async Task HideSplashAfterDelayAsync(long id, long version, long milliseconds)
+    {
+        var token = transition?.Token ?? lifetime.Token;
+        try
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(milliseconds), token);
+            if (!viewState.Matches(id, version)) return;
+            if (!viewState.HasHost)
+                viewState.SetError(id, version, "正在等待浏览器初始化，完成后将自动显示；也可以稍后重试");
+            else viewState.HideSplash(id, version);
+            RefreshVisibleState();
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private async Task AddAccountAsync()
+    {
+        if (closing) return;
+        try
+        {
+            var previous = store.FindById(store.GetCurrentId());
+            var account = store.AddDefault(previous?.Proxy, previous?.ForceProxy == true);
+            editId = confirmDelId = -1;
+            await SwitchTo(account.Id, animate: true);
+            Toast(string.Format(Strings.ToastCreatedFmt, account.Name));
+        }
+        catch (Exception ex) { ReportOperationFailure("未能创建账号", ex); }
     }
 
     private void CommitRename(long id, TextBox input)
     {
-        var a = store.FindById(id);
-        editId = -1;
-        if (a == null)
-        {
-            RenderAccounts();
-            return;
-        }
         var name = input.Text.Trim();
-        if (name.Length > 16) name = name[..16];
-        if (name.Length == 0 || name == a.Name)
-        {
-            RenderAccounts();
-            return;
-        }
-        store.Rename(id, name);
-        RenderAccounts();
-        Toast(string.Format(Strings.ToastRenamedFmt, name));
-    }
-
-    private async void DeleteAccount(long id)
-    {
-        if (store.FindById(id) == null) return;
-        // 销毁该账号的 WebView 实例
-        var host = webViews.Get(id);
-        if (host != null)
-        {
-            webViews.Remove(id);
-            if (currentWebView == host) currentWebView = null;
-            WebContainer.Children.Remove(host.Control);
-            host.Dispose();
-        }
-        creatingTasks.Remove(id);
-        webLoaded.Remove(id);
-        webErrored.Remove(id);
-        loadStartAt.Remove(id);
-
-        // 清除该账号的磁盘环境（浏览器进程退出可能需要几秒，后台重试删除）
-        _ = Task.Run(() => DeleteProfileDirWithRetry(AccountWebHost.ProfileDir(id)));
-
-        store.Remove(id);
         editId = -1;
-        confirmDelId = -1;
+        if (string.IsNullOrEmpty(name)) { RenderAccounts(); return; }
+        try { store.Rename(id, LimitText(name, 16)); }
+        catch (Exception ex) { ReportOperationFailure("名称未保存", ex); }
         RenderAccounts();
-        Toast(Strings.ToastDeleted);
-        ProbeNonAliveSoon();
-
-        var cur = store.GetCurrentId();
-        if (cur >= 0)
-        {
-            await SwitchTo(cur, animate: true);
-        }
     }
 
-    private static void DeleteProfileDirWithRetry(string dir)
+    private static string LimitText(string value, int count)
     {
-        for (var attempt = 0; attempt < 10; attempt++)
+        var elements = StringInfo.GetTextElementEnumerator(value);
+        var text = new System.Text.StringBuilder();
+        for (var index = 0; index < count && elements.MoveNext(); index++) text.Append(elements.GetTextElement());
+        return text.ToString();
+    }
+
+    private async Task DeleteAccountAsync(long id)
+    {
+        if (closing || store.FindById(id) == null || !changingAccounts.Add(id)) return;
+        try
+        {
+            if (viewState.AccountId == id)
+            {
+                transition?.Cancel();
+                viewState.Clear();
+                RefreshVisibleState();
+            }
+            await sessions.InvalidateAsync(id);
+            // 落盘成功后才删目录，保存失败不会留下“账号仍在、登录数据已删”的状态。
+            store.Remove(id);
+            recoveryAttempts.Remove(id);
+            editId = confirmDelId = -1;
+            RenderAccounts();
+            var removed = await DeleteProfileDirectoryAsync(ProfilePath(id));
+            Toast(removed ? Strings.ToastDeleted : "账号已移除，但旧目录仍被占用；已保留，不会用于新账号");
+        }
+        catch (Exception ex) { ReportOperationFailure("删除未完成，账号数据已保留", ex); }
+        finally { changingAccounts.Remove(id); }
+        if (!closing && store.GetCurrentId() > 0) await SwitchTo(store.GetCurrentId(), animate: true);
+        else if (!closing) { viewState.Clear(); RefreshVisibleState(); }
+    }
+
+    private static async Task<bool> DeleteProfileDirectoryAsync(string directory)
+    {
+        for (var attempt = 0; attempt < 5; attempt++)
         {
             try
             {
-                if (!Directory.Exists(dir)) return;
-                Directory.Delete(dir, recursive: true);
-                Log.I("MuseWebview", $"profile dir deleted: {dir}");
-                return;
+                await Task.Run(() => { if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true); });
+                return true;
             }
-            catch when (attempt < 9)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                Thread.Sleep(700); // 进程树退出中，稍后重试
-            }
-            catch (Exception ex)
-            {
-                Log.I("MuseWebview", $"profile dir delete failed: {dir} {ex.Message}");
-                return;
+                if (attempt == 4) return false;
+                await Task.Delay(300);
             }
         }
+        return false;
     }
-
-    // ---------- 登录态探测 ----------
 
     private async Task ProbeAliveAsync(AccountWebHost host)
     {
         try
         {
             var names = await host.GetMuseCookieNamesAsync();
-            UpdateLogged(host.AccountId, AuthProbe.IsLogged(names));
+            if (!closing && sessions.IsRegistered(host.AccountId, host)) UpdateLogged(host.AccountId, CookieProbe.IsLogged(names));
         }
-        catch
-        {
-            // webview 可能刚被驱逐
-        }
+        catch (Exception ex) { Log.I("MuseAuth", $"probe unavailable id={host.AccountId} type={ex.GetType().Name}"); }
     }
 
     private void UpdateLogged(long id, bool? logged)
     {
-        if (logged == null) return;
-        var a = store.FindById(id);
-        if (a == null || a.Logged == logged) return;
-        a.Logged = logged.Value;
-        RenderAccounts();
+        if (logged == null || closing) return;
+        var account = store.FindById(id);
+        if (account == null || account.Logged == logged) return;
+        store.SetLogged(id, logged.Value);
+        if (editId < 0 && confirmDelId < 0) RenderAccounts();
     }
 
-    /// <summary>后台探测未活动账号（读磁盘 Cookies 库，尽力而为）；已有探测在跑则合并下一轮。</summary>
     private async void ProbeNonAliveSoon()
     {
-        if (probingDisk)
-        {
-            probeDiskDirty = true;
-            return;
-        }
+        if (closing || sessions == null) return;
+        if (probingDisk) { probeDiskDirty = true; return; }
         probingDisk = true;
         try
         {
             do
             {
                 probeDiskDirty = false;
-                var targets = store.All().Where(a => !webViews.Contains(a.Id)).ToList();
-                foreach (var (id, logged) in await AuthProbe.ProbeAccountsAsync(targets))
+                var hosts = sessions.Snapshot();
+                foreach (var account in store.All())
                 {
-                    UpdateLogged(id, logged);
+                    if (closing) return;
+                    if (hosts.TryGetValue(account.Id, out var host)) { await ProbeAliveAsync(host); continue; }
+                    var names = await Task.Run(() => CookieProbe.ProbeCookieNamesOnDisk(ProfilePath(account.Id)));
+                    if (!sessions.Snapshot().ContainsKey(account.Id))
+                        UpdateLogged(account.Id, names == null ? null : CookieProbe.IsLogged(names));
                 }
-            } while (probeDiskDirty);
+            } while (probeDiskDirty && !closing);
         }
-        finally
-        {
-            probingDisk = false;
-        }
+        catch (Exception ex) { Log.I("MuseAuth", "disk probe failed: " + ex.GetType().Name); }
+        finally { probingDisk = false; }
     }
 
-    // ---------- 渲染 ----------
+    private async void OnClosing(object? sender, CancelEventArgs e)
+    {
+        if (closed) return;
+        e.Cancel = true;
+        if (closing) return;
+        closing = true;
+        lifetime.Cancel();
+        transition?.Cancel();
+        viewState.Close();
+        toastTimer.Stop();
+        ToastPopup.IsOpen = false;
+        RefreshVisibleState();
+        try { await sessions.CloseAsync(); }
+        catch (Exception ex)
+        {
+            Log.I("MuseWebview", "close failed: " + ex.GetType().Name);
+            MessageBox.Show("部分浏览器未在超时内退出，账号目录未删除。下次启动会检查目录占用。", Strings.AppName);
+        }
+        finally { closed = true; Close(); }
+    }
+
+    private void ReportOperationFailure(string operation, Exception exception)
+    {
+        Log.I("App", operation + ": " + exception.GetType().Name);
+        if (!closing) Toast(operation + "。请检查磁盘权限、剩余空间或浏览器占用情况。");
+    }
+
+    // ---------- 账号列表 ----------
 
     private void RenderAccounts()
     {
+        if (store == null || closing) return;
         RailAvatars.Children.Clear();
         AccountList.Children.Clear();
-        var q = SearchInput.Text.Trim();
+        var query = SearchInput.Text.Trim();
+        var accounts = store.All();
         var shown = 0;
-        foreach (var a in store.All())
+        foreach (var account in accounts)
         {
-            if (!Matches(a, q)) continue;
+            if (!Matches(account, query)) continue;
             shown++;
-            RailAvatars.Children.Add(MakeRailAvatar(a));
-            AccountList.Children.Add(MakeDrawerRow(a));
+            RailAvatars.Children.Add(MakeRailAvatar(account));
+            AccountList.Children.Add(MakeDrawerRow(account));
         }
-        AccCount.Text = string.Format(Strings.AccountsCountFmt, store.All().Count);
-        EmptyState.Visibility = store.All().Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-        DrawerEmpty.Visibility = q.Length > 0 && shown == 0 ? Visibility.Visible : Visibility.Collapsed;
+        AccCount.Text = string.Format(Strings.AccountsCountFmt, accounts.Count);
+        EmptyState.Visibility = accounts.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        DrawerEmpty.Visibility = query.Length > 0 && shown == 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
-    /// <summary>按 名称 + 标签 过滤（忽略大小写，空 query 全匹配）</summary>
-    private static bool Matches(Account a, string q)
+    private static bool Matches(Account account, string query)
+        => query.Length == 0 || account.Name.Contains(query, StringComparison.OrdinalIgnoreCase)
+            || account.Tags.Any(tag => tag.Contains(query, StringComparison.OrdinalIgnoreCase));
+
+    private FrameworkElement MakeRailAvatar(Account account)
     {
-        if (q.Length == 0) return true;
-        var key = q.ToLowerInvariant();
-        if (a.Name.ToLowerInvariant().Contains(key)) return true;
-        return a.Tags.Any(t => t.ToLowerInvariant().Contains(key));
-    }
-
-    private void ShowSplashFor(Account a)
-    {
-        SplashTile.Text = string.IsNullOrEmpty(a.Avatar) ? "m" : a.Avatar;
-        SplashName.Text = a.Name;
-        Splash.Visibility = Visibility.Visible;
-        currentWebView?.SetVisible(false);
-        splashShownAt = Tick();
-
-        splashLoadedTimer ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(SplashLoadedHideMs) };
-        splashLoadedTimer.Tick += (_, _) => { splashLoadedTimer!.Stop(); HideSplash(); };
-        splashLoadedTimer.Stop();
-
-        splashFallbackTimer ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(SplashTimeoutMs) };
-        splashFallbackTimer.Tick += (_, _) => { splashFallbackTimer!.Stop(); HideSplash(); };
-        splashFallbackTimer.Stop();
-
-        // 已加载过的账号不会再次触发 NavigationCompleted，直接短延时收起
-        if (webLoaded.GetValueOrDefault(a.Id)) splashLoadedTimer.Start();
-        // 兜底：加载异常时也不会卡在过渡层
-        splashFallbackTimer.Start();
-    }
-
-    private void HideSplashAfterMinDelay()
-    {
-        if (Splash.Visibility != Visibility.Visible) return;
-        var elapsed = Tick() - splashShownAt;
-        var delay = Math.Max(0, MinSplashMs - elapsed);
-
-        splashMinDelayTimer ??= new DispatcherTimer();
-        splashMinDelayTimer.Tick += (_, _) => { splashMinDelayTimer!.Stop(); HideSplash(); };
-        splashMinDelayTimer.Interval = TimeSpan.FromMilliseconds(delay);
-        splashMinDelayTimer.Stop();
-        splashMinDelayTimer.Start();
-    }
-
-    private void HideSplash()
-    {
-        splashLoadedTimer?.Stop();
-        splashFallbackTimer?.Stop();
-        Splash.Visibility = Visibility.Collapsed;
-        if (!webErrored.GetValueOrDefault(store.GetCurrentId()))
+        var grid = new Grid { Width = 40, Height = 40, Margin = new Thickness(0, 4, 0, 4), Cursor = Cursors.Hand };
+        grid.Children.Add(new Border
         {
-            currentWebView?.SetVisible(true);
-        }
+            Background = account.Id == store.GetCurrentId() ? RowBrush(true) : Brushes.Transparent,
+            CornerRadius = new CornerRadius(20), Child = MakeTile(38, 20, account.Avatar),
+        });
+        grid.Children.Add(new Border
+        {
+            Width = 10, Height = 10, CornerRadius = new CornerRadius(5),
+            HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Bottom,
+            Background = StatusBrush(account.Logged),
+        });
+        grid.MouseLeftButtonUp += async (_, e) => { e.Handled = true; await SwitchTo(account.Id, animate: true); };
+        return grid;
     }
 
-    private Border MakeRailAvatar(Account a)
+    private FrameworkElement MakeDrawerRow(Account account)
     {
-        var wrap = new Border
+        var row = new Border
         {
-            Width = 40,
-            Height = 40,
-            CornerRadius = new CornerRadius(20),
-            Margin = new Thickness(0, 4, 0, 4),
-            Background = a.Id == store.GetCurrentId() ? new SolidColorBrush(Color.FromRgb(0x1B, 0x27, 0x40)) : Brushes.Transparent,
-            Child = MakeTile(38, 20, a.Avatar),
-            Cursor = Cursors.Hand,
+            Background = RowBrush(account.Id == store.GetCurrentId()), CornerRadius = new CornerRadius(10),
+            Padding = new Thickness(10, 9, 10, 9), Margin = new Thickness(0, 0, 0, 4), Cursor = Cursors.Hand,
         };
-        wrap.MouseLeftButtonUp += (_, _) => _ = SwitchTo(a.Id, animate: true);
-
-        var dot = new Border
+        var dock = new DockPanel { LastChildFill = true };
+        row.Child = dock;
+        if (confirmDelId == account.Id)
         {
-            Width = 10,
-            Height = 10,
-            CornerRadius = new CornerRadius(5),
-            HorizontalAlignment = HorizontalAlignment.Right,
-            VerticalAlignment = VerticalAlignment.Bottom,
-            Margin = new Thickness(0, 0, 1, 1),
-            Background = new SolidColorBrush(a.Logged
-                ? Color.FromRgb(0x34, 0xC7, 0x59)
-                : Color.FromRgb(0x4A, 0x4F, 0x57)),
-        };
-        var grid = new Grid();
-        grid.Children.Add(wrap);
-        grid.Children.Add(dot);
-        return new Border { Child = grid };
-    }
-
-    private FrameworkElement MakeDrawerRow(Account a)
-    {
-        // 删除确认态。DockPanel 按添加顺序停靠、最后一个子元素填充：
-        // 先加靠右按钮（后加的靠左），最后加消息（填充）
-        if (confirmDelId == a.Id)
-        {
-            var row = new Border
+            dock.Children.Add(MakeTextBtn(Strings.BtnCancel, false, () => { confirmDelId = -1; RenderAccounts(); }));
+            dock.Children.Add(MakeTextBtn(Strings.BtnDelete, true, () => _ = DeleteAccountAsync(account.Id)));
+            dock.Children.Add(new TextBlock
             {
-                Background = RowBrush(false),
-                CornerRadius = new CornerRadius(10),
-                Padding = new Thickness(10, 9, 10, 9),
-                Margin = new Thickness(0, 0, 0, 4),
-            };
-            var dp = new DockPanel { LastChildFill = true };
-            dp.Children.Add(MakeTextBtn(Strings.BtnCancel, danger: false, () =>
-            {
-                confirmDelId = -1;
-                RenderAccounts();
-            }));
-            dp.Children.Add(MakeTextBtn(Strings.BtnDelete, danger: true, () => DeleteAccount(a.Id)));
-            dp.Children.Add(new TextBlock
-            {
-                Text = string.Format(Strings.ConfirmDeleteFmt, a.Name),
-                Foreground = ForegroundBrush,
-                FontSize = 12.5,
-                LineHeight = 20,
-                TextWrapping = TextWrapping.Wrap,
-                VerticalAlignment = VerticalAlignment.Center,
+                Text = string.Format(Strings.ConfirmDeleteFmt, account.Name), Foreground = ForegroundBrush,
+                FontSize = 12.5, LineHeight = 20, TextWrapping = TextWrapping.Wrap, VerticalAlignment = VerticalAlignment.Center,
             });
-            row.Child = dp;
             return row;
         }
-
-        // 重命名编辑态：tile | 输入框(填充) | ✓ | ✕
-        if (editId == a.Id)
+        if (editId == account.Id)
         {
-            var row = new Border
+            dock.Children.Add(MakeIconBtn("\uE711", Strings.BtnCancel, () => { editId = -1; RenderAccounts(); }));
+            dock.Children.Add(MakeIconBtn("\uE73E", Strings.CdRename, () =>
             {
-                Background = RowBrush(false),
-                CornerRadius = new CornerRadius(10),
-                Padding = new Thickness(10, 9, 10, 9),
-                Margin = new Thickness(0, 0, 0, 4),
-            };
-            var dp = new DockPanel { LastChildFill = true };
-            dp.Children.Add(MakeIconBtn("\uE711", Strings.BtnCancel, () =>
-            {
-                editId = -1;
-                RenderAccounts();
+                if (renameInput != null) CommitRename(account.Id, renameInput);
             }));
-            dp.Children.Add(MakeIconBtn("\uE73E", Strings.CdRename, () =>
-            {
-                if (renameInput != null) CommitRename(a.Id, renameInput);
-            }));
-            dp.Children.Add(MakeTile(40, 20, a.Avatar));
-
+            dock.Children.Add(MakeTile(40, 20, account.Avatar));
             var input = new TextBox
             {
-                Text = a.Name,
-                Foreground = ForegroundBrush,
-                FontSize = 13.5,
-                Background = new SolidColorBrush(Color.FromRgb(0x0F, 0x11, 0x14)),
-                BorderThickness = new Thickness(1),
-                BorderBrush = new SolidColorBrush(Color.FromRgb(0x2F, 0x7C, 0xF6)),
-                Padding = new Thickness(8, 6, 8, 6),
+                Text = account.Name, Foreground = ForegroundBrush, FontSize = 13.5,
+                Background = RowBrush(false), BorderBrush = Brushes.DodgerBlue,
+                Padding = new Thickness(8, 6, 8, 6), Margin = new Thickness(8, 0, 0, 0),
                 VerticalContentAlignment = VerticalAlignment.Center,
-                MaxLength = 32,
-                Margin = new Thickness(8, 0, 0, 0),
             };
-            dp.Children.Add(input);
             renameInput = input;
+            dock.Children.Add(input);
             input.KeyDown += (_, e) =>
             {
-                if (e.Key == Key.Enter) CommitRename(a.Id, input);
-                else if (e.Key == Key.Escape)
-                {
-                    editId = -1;
-                    RenderAccounts();
-                }
+                if (e.Key == Key.Enter) { e.Handled = true; CommitRename(account.Id, input); }
+                else if (e.Key == Key.Escape) { e.Handled = true; editId = -1; RenderAccounts(); }
             };
-            input.LostFocus += (_, _) => { if (editId == a.Id) CommitRename(a.Id, input); };
-            row.Child = dp;
             input.Loaded += (_, _) => { input.Focus(); input.SelectAll(); };
             return row;
         }
-
-        // 常规态：tile | 信息(填充) | 设置 | 重命名 | 删除
-        var normal = new Border
-        {
-            Background = RowBrush(a.Id == store.GetCurrentId()),
-            CornerRadius = new CornerRadius(10),
-            Padding = new Thickness(10, 9, 10, 9),
-            Margin = new Thickness(0, 0, 0, 4),
-            Cursor = Cursors.Hand,
-        };
-        var dock = new DockPanel { LastChildFill = true };
-        dock.Children.Add(MakeIconBtn("\uE74D", Strings.CdDelete, () =>
-        {
-            confirmDelId = a.Id;
-            editId = -1;
-            RenderAccounts();
-        }));
-        dock.Children.Add(MakeIconBtn("\uE70F", Strings.CdRename, () =>
-        {
-            editId = a.Id;
-            confirmDelId = -1;
-            RenderAccounts();
-        }));
-        dock.Children.Add(MakeIconBtn("\uE713", Strings.CdConfig, () => OpenConfig(a.Id)));
-        dock.Children.Add(MakeTile(40, 20, a.Avatar));
-
-        var info = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+        dock.Children.Add(MakeIconBtn("\uE74D", Strings.CdDelete, () => { confirmDelId = account.Id; editId = -1; RenderAccounts(); }));
+        dock.Children.Add(MakeIconBtn("\uE70F", Strings.CdRename, () => { editId = account.Id; confirmDelId = -1; RenderAccounts(); }));
+        dock.Children.Add(MakeIconBtn("\uE713", Strings.CdConfig, () => _ = OpenConfigAsync(account.Id)));
+        dock.Children.Add(MakeTile(40, 20, account.Avatar));
+        var info = new StackPanel { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0) };
         info.Children.Add(new TextBlock
         {
-            Text = a.Name,
-            Foreground = ForegroundBrush,
-            FontSize = 14.5,
-            FontWeight = FontWeights.Bold,
-            TextTrimming = TextTrimming.CharacterEllipsis,
+            Text = account.Name, Foreground = ForegroundBrush, FontSize = 14.5,
+            FontWeight = FontWeights.Bold, TextTrimming = TextTrimming.CharacterEllipsis,
         });
-        var statusColor = new SolidColorBrush(a.Logged
-            ? Color.FromRgb(0x34, 0xC7, 0x59)
-            : Color.FromRgb(0x4A, 0x4F, 0x57));
-        var sub = new TextBlock { FontSize = 11.5, Foreground = MutedBrush, Margin = new Thickness(0, 3, 0, 0) };
-        sub.Inlines.Add(new System.Windows.Documents.Run("● ") { Foreground = statusColor });
-        sub.Inlines.Add(a.Logged ? Strings.StatusLogged : Strings.StatusNotLogged);
-        info.Children.Add(sub);
-
-        dock.Children.Add(info); // 最后添加 = 填充中间
-
-        normal.Child = dock;
-        normal.MouseLeftButtonUp += (_, _) => _ = SwitchTo(a.Id, animate: true);
-        return normal;
+        var status = new TextBlock { Foreground = MutedBrush, FontSize = 11.5, Margin = new Thickness(0, 3, 0, 0),
+            TextTrimming = TextTrimming.CharacterEllipsis };
+        status.Inlines.Add(new System.Windows.Documents.Run("● ") { Foreground = StatusBrush(account.Logged) });
+        status.Inlines.Add(account.Logged ? Strings.StatusLogged : Strings.StatusNotLogged);
+        info.Children.Add(status);
+        dock.Children.Add(info);
+        row.MouseLeftButtonUp += async (_, e) =>
+        {
+            if (IsButtonSource(e.OriginalSource as DependencyObject)) return;
+            e.Handled = true;
+            await SwitchTo(account.Id, animate: true);
+        };
+        return row;
     }
 
-    private TextBox? renameInput;
+    private static bool IsButtonSource(DependencyObject? source)
+    {
+        while (source != null)
+        {
+            if (source is ButtonBase) return true;
+            source = source is Visual ? VisualTreeHelper.GetParent(source) : LogicalTreeHelper.GetParent(source);
+        }
+        return false;
+    }
 
     private static readonly Brush ForegroundBrush = new SolidColorBrush(Color.FromRgb(0xE9, 0xEB, 0xEE));
     private static readonly Brush MutedBrush = new SolidColorBrush(Color.FromRgb(0x8A, 0x90, 0x99));
+    private static Brush RowBrush(bool active) => new SolidColorBrush(active
+        ? Color.FromRgb(0x1B, 0x27, 0x40) : Color.FromRgb(0x15, 0x17, 0x1C));
+    private static Brush StatusBrush(bool logged) => new SolidColorBrush(logged
+        ? Color.FromRgb(0x34, 0xC7, 0x59) : Color.FromRgb(0x4A, 0x4F, 0x57));
 
-    private static Brush RowBrush(bool active)
+    private static Border MakeTile(double size, double fontSize, string? text) => new()
     {
-        return active
-            ? new SolidColorBrush(Color.FromRgb(0x1B, 0x27, 0x40))
-            : new SolidColorBrush(Color.FromRgb(0x15, 0x17, 0x1C));
-    }
-
-    private Border MakeTile(double sizePx, double fontSize, string? text)
-    {
-        return new Border
+        Width = size, Height = size, CornerRadius = new CornerRadius(size * 0.28),
+        Background = new SolidColorBrush(Color.FromRgb(0x15, 0x1C, 0x28)),
+        Child = new TextBlock
         {
-            Width = sizePx,
-            Height = sizePx,
-            CornerRadius = new CornerRadius(sizePx * 0.28),
-            Background = new SolidColorBrush(Color.FromRgb(0x15, 0x1C, 0x28)),
-            Child = new TextBlock
-            {
-                Text = string.IsNullOrEmpty(text) ? "m" : text,
-                FontFamily = new FontFamily("Georgia"),
-                FontWeight = FontWeights.Bold,
-                FontStyle = FontStyles.Italic,
-                FontSize = fontSize,
-                Foreground = new SolidColorBrush(Color.FromRgb(0x2F, 0x7C, 0xF6)),
-                HorizontalAlignment = HorizontalAlignment.Center,
-                VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(0, 0, 0, sizePx * 0.1),
-            },
-        };
-    }
+            Text = string.IsNullOrEmpty(text) ? "m" : text, FontFamily = new FontFamily("Georgia"),
+            FontWeight = FontWeights.Bold, FontStyle = FontStyles.Italic, FontSize = fontSize,
+            Foreground = Brushes.DodgerBlue, HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 0, size * 0.1),
+        },
+    };
 
-    private Button MakeIconBtn(string glyph, string toolTip, Action onClick)
+    private Button MakeIconBtn(string glyph, string tooltip, Action onClick)
     {
-        var b = new Button
+        var button = new Button
         {
-            Style = (Style)Resources["IconButtonSm"],
-            ToolTip = toolTip,
-            Content = new TextBlock
-            {
-                Text = glyph,
-                FontFamily = new FontFamily("Segoe MDL2 Assets"),
-                FontSize = 12,
-                Foreground = new SolidColorBrush(Color.FromRgb(0x7D, 0x83, 0x8C)),
-            },
-            Margin = new Thickness(6, 0, 0, 0),
-            VerticalAlignment = VerticalAlignment.Center,
+            Style = (Style)Resources["IconButtonSm"], ToolTip = tooltip,
+            Content = new TextBlock { Text = glyph, FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 12, Foreground = MutedBrush },
+            Margin = new Thickness(6, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center,
         };
-        DockPanel.SetDock(b, Dock.Right);
-        b.Click += (_, _) => onClick();
-        return b;
+        DockPanel.SetDock(button, Dock.Right);
+        button.Click += (_, e) => { e.Handled = true; onClick(); };
+        return button;
     }
 
     private Button MakeTextBtn(string text, bool danger, Action onClick)
     {
-        var b = new Button
+        var button = new Button
         {
-            Content = text,
-            FontSize = 12,
-            Foreground = Brushes.White,
-            Padding = new Thickness(10, 6, 10, 6),
-            Margin = new Thickness(6, 0, 0, 0),
-            VerticalAlignment = VerticalAlignment.Center,
-            Background = new SolidColorBrush(danger
-                ? Color.FromRgb(0x8C, 0x2F, 0x36)
-                : Color.FromRgb(0x22, 0x25, 0x2C)),
-            Template = (ControlTemplate)FindResource("PillTemplate"),
+            Content = text, FontSize = 12, Foreground = Brushes.White, Padding = new Thickness(10, 6, 10, 6),
+            Margin = new Thickness(6, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center,
+            Background = danger ? Brushes.IndianRed : RowBrush(false), Template = (ControlTemplate)Resources["PillTemplate"],
         };
-        DockPanel.SetDock(b, Dock.Right);
-        b.Click += (_, _) => onClick();
-        return b;
+        DockPanel.SetDock(button, Dock.Right);
+        button.Click += (_, e) => { e.Handled = true; onClick(); };
+        return button;
     }
 
-    // ---------- 配置页 ----------
-
-    private void OpenConfig(long id)
+    private async Task OpenConfigAsync(long id)
     {
-        var a = store.FindById(id);
-        if (a == null) return;
-        var win = new AccountConfigWindow(a) { Owner = this };
-        win.ShowDialog();
-
-        if (win.Changed)
+        if (closing || changingAccounts.Contains(id)) return;
+        var account = store.FindById(id);
+        if (account == null) return;
+        try
         {
-            // 配置窗口只改内存对象，落盘必须在这里做（与安卓 AccountConfigActivity.persist 一致）
-            store.Save();
+            var window = new AccountConfigWindow(account, updated => store.Update(updated)) { Owner = this };
+            window.ShowDialog();
+            RenderAccounts();
+            if (!window.Saved || !window.ProxyChanged) return;
+            await ApplySavedConfigurationAsync(id);
         }
-        RenderAccounts();
-
-        if (win.ProxyChanged && webViews.Get(id) != null)
-        {
-            // 代理变了：驱逐该账号环境，下次进入按新代理重建（登录数据在磁盘，不受影响）
-            EvictWebView(id);
-            if (store.GetCurrentId() == id)
-            {
-                _ = SwitchTo(id, animate: true);
-            }
-        }
-        ProbeNonAliveSoon();
+        catch (Exception ex) { ReportOperationFailure("配置或环境重建失败，请重试", ex); }
     }
 
-    // ---------- 抽屉/侧栏 ----------
+    internal async Task ApplySavedConfigurationAsync(long id)
+    {
+        if (!changingAccounts.Add(id)) return;
+        var wasCurrent = store.GetCurrentId() == id;
+        if (wasCurrent) { transition?.Cancel(); viewState.Clear(); RefreshVisibleState(); }
+        try { await sessions.InvalidateAsync(id); }
+        finally { changingAccounts.Remove(id); }
+        if (wasCurrent && !closing && store.GetCurrentId() == id) await SwitchTo(id, animate: true);
+    }
 
     private void OpenDrawer()
     {
-        if (fullscreen) return;
+        if (fullscreen || closing) return;
         SidebarCol.Width = new GridLength(274);
         Rail.Visibility = Visibility.Collapsed;
         DrawerContent.Visibility = Visibility.Visible;
@@ -857,88 +654,48 @@ public partial class MainWindow : Window
 
     private void CloseDrawer()
     {
+        if (fullscreen) return;
         SidebarCol.Width = new GridLength(56);
         DrawerContent.Visibility = Visibility.Collapsed;
         Rail.Visibility = Visibility.Visible;
     }
 
-    // ---------- Toast ----------
-
-    private void Toast(string msg)
+    private void Toast(string message)
     {
-        ToastText.Text = msg;
+        if (closing) return;
+        ToastText.Text = message;
         ToastPopup.IsOpen = true;
-        toastTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(2.2) };
-        toastTimer.Tick += ToastTimerTick;
         toastTimer.Stop();
         toastTimer.Start();
     }
 
-    private void ToastTimerTick(object? sender, EventArgs e)
-    {
-        toastTimer!.Stop();
-        ToastPopup.IsOpen = false;
-    }
-
-    // ---------- 事件 ----------
-
     private void OnRailExpandClick(object sender, RoutedEventArgs e) => OpenDrawer();
-
     private void OnCollapseClick(object sender, RoutedEventArgs e) => CloseDrawer();
-
-    private void OnAddAccountClick(object sender, RoutedEventArgs e) => AddAccount();
-
-    private void OnFullscreenClick(object sender, RoutedEventArgs e) => EnterFullscreen();
-
+    private async void OnAddAccountClick(object sender, RoutedEventArgs e) => await AddAccountAsync();
+    private void OnFullscreenClick(object sender, RoutedEventArgs e) => SetFullscreen(!fullscreen);
     private void OnSearchTextChanged(object sender, TextChangedEventArgs e) => RenderAccounts();
-
-    private void OnRetryClick(object sender, RoutedEventArgs e)
+    private async void OnRetryClick(object sender, RoutedEventArgs e)
     {
-        var curId = store.GetCurrentId();
-        var host = currentWebView;
-        if (host != null && curId >= 0)
-        {
-            webErrored[curId] = false;
-            HideErrorOverlay();
-            loadStartAt[curId] = Tick();
-            Log.I("MusePerf", $"load retry id={curId}");
-            host.Reload();
-        }
+        var id = store.GetCurrentId();
+        recoveryAttempts.Remove(id);
+        if (id > 0) await SwitchTo(id, animate: true, reload: true);
     }
 
     private void OnPreviewKeyDown(object sender, KeyEventArgs e)
     {
-        if (e.Key == Key.F11)
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+        if (key == Key.F11) { SetFullscreen(!fullscreen); e.Handled = true; }
+        else if (key == Key.Escape)
         {
-            if (fullscreen) ExitFullscreen();
-            else EnterFullscreen();
-            e.Handled = true;
-            return;
+            if (editId > 0) { editId = -1; RenderAccounts(); e.Handled = true; }
+            else if (fullscreen) { SetFullscreen(false); e.Handled = true; }
+            else if (DrawerContent.Visibility == Visibility.Visible) { CloseDrawer(); e.Handled = true; }
         }
-        if (e.Key == Key.Escape)
+        else if (e.KeyboardDevice.Modifiers == ModifierKeys.Alt && key == Key.Left
+            && sessions.Current is { CanGoBack: true } host)
         {
-            if (fullscreen)
-            {
-                ExitFullscreen();
-                e.Handled = true;
-            }
-            else if (DrawerContent.Visibility == Visibility.Visible)
-            {
-                CloseDrawer();
-                e.Handled = true;
-            }
-            else if (currentWebView is { CanGoBack: true })
-            {
-                currentWebView.GoBack();
-                e.Handled = true;
-            }
-            return;
-        }
-        if (e.KeyboardDevice.Modifiers == ModifierKeys.Alt && e.Key == Key.Left
-            && currentWebView is { CanGoBack: true })
-        {
-            currentWebView.GoBack();
-            e.Handled = true;
+            try { host.GoBack(); e.Handled = true; }
+            catch (Exception ex) { ReportOperationFailure("无法返回上一页", ex); }
         }
     }
 }

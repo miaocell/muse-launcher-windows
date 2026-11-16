@@ -1,20 +1,29 @@
-# Muse 登录器 (Windows) 构建脚本 —— 在 Windows 本机运行
-# 用法: powershell -ExecutionPolicy Bypass -File build.ps1
+# Windows 本地候选包构建。不提交、推送或发布 GitHub。
+param([switch]$RunWindowsSmoke)
 $ErrorActionPreference = "Stop"
-
-$version = "1.0.3"
-$outDir = "publish/win-x64"
-$zip = "publish/MuseLauncher-win-x64-v$version.zip"
-
-Write-Host "== 单元测试 ==" -ForegroundColor Cyan
-dotnet test tests/MuseLauncher.Core.Tests
-if ($LASTEXITCODE -ne 0) { exit 1 }
-
-Write-Host "== 发布 (self-contained win-x64) ==" -ForegroundColor Cyan
-dotnet publish src/MuseLauncher -c Release -r win-x64 --self-contained true -o $outDir
-if ($LASTEXITCODE -ne 0) { exit 1 }
-
-Write-Host "== 打包 ==" -ForegroundColor Cyan
-if (Test-Path $zip) { Remove-Item $zip }
-Compress-Archive -Path $outDir -DestinationPath $zip
-Write-Host "完成: $zip" -ForegroundColor Green
+Push-Location $PSScriptRoot
+try {
+    $version = "1.0.4-rc.1"
+    $outDir = "publish/candidate-win-x64"
+    $zip = "publish/MuseLauncher-win-x64-v$version.zip"
+    Write-Host "== Core + loopback 协议回归 ==" -ForegroundColor Cyan
+    dotnet test tests/MuseLauncher.Core.Tests -c Release
+    if ($LASTEXITCODE -ne 0) { throw "回归测试失败，停止打包" }
+    Write-Host "== 编译 Windows WebView2 冒烟入口 ==" -ForegroundColor Cyan
+    dotnet build tests/MuseLauncher.WindowsSmoke -c Release
+    if ($LASTEXITCODE -ne 0) { throw "Windows 冒烟入口编译失败" }
+    if ($RunWindowsSmoke) {
+        dotnet run --project tests/MuseLauncher.WindowsSmoke -c Release --no-build
+        if ($LASTEXITCODE -ne 0) { throw "Windows 冒烟测试失败，停止打包" }
+    } else {
+        Write-Warning "未运行 Windows WebView2 冒烟测试；本次输出仅为候选包"
+    }
+    Write-Host "== 本地候选包 ==" -ForegroundColor Cyan
+    dotnet publish src/MuseLauncher -c Release -r win-x64 --self-contained true -o $outDir
+    if ($LASTEXITCODE -ne 0) { throw "发布构建失败" }
+    if (Test-Path $zip) { throw "候选包已存在，请另存或确认后手动移除：$zip" }
+    Compress-Archive -Path $outDir -DestinationPath $zip
+    Write-Host "完成：$zip" -ForegroundColor Green
+} finally {
+    Pop-Location
+}

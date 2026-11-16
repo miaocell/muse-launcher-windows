@@ -41,6 +41,7 @@ public class AccountsStoreTest
         b.Proxy = "socks5://127.0.0.1:1080";
         b.Avatar = "M";
         b.Tags.Add("测试");
+        s1.Update(b);
         s1.SetCurrent(a.Id);
         s1.Save();
 
@@ -91,8 +92,8 @@ public class AccountsStoreTest
         var s = new AccountsStore(kv);
         var a = s.AddDefault();              // save#1（prev 为空）
         a.Proxy = "http://1.2.3.4:3129";
-        s.Save();                            // save#2（prev = save#1 的值，proxy 还是空）
-        s.Save();                            // save#3（prev = save#2 的值，带 proxy）
+        s.Update(a);                        // save#2：提交独立草稿，prev = save#1
+        s.Save();                           // save#3：prev 带已提交的 proxy
         var goodList = kv.GetString("list", null);
         Assert.NotNull(goodList);
         Assert.StartsWith("[", kv.GetString("list_prev", "MISSING"));
@@ -115,33 +116,27 @@ public class AccountsStoreTest
         Assert.Equal(2L, added.Id);
     }
 
-    /// <summary>list 与 list_prev 双双损坏 → 留底 + 通知 corrupt + 空列表，不再抛异常</summary>
+    /// <summary>主列表和备份均坏时停止加载，不能把旧账号当空存储覆盖。</summary>
     [Fact]
-    public void CorruptEverything_BacksUpAndDegrades()
+    public void CorruptEverything_PreservesRawAndBlocksLoading()
     {
         var kv = new FakeKv();
         kv.PutString("list", "{{{坏数据");
         kv.PutString("list_prev", "]]]也是坏的");
-        var s = new AccountsStore(kv);
-        Assert.Equal("corrupt", s.TakeLoadNotice());
-        Assert.Empty(s.All());
-        Assert.Equal("{{{坏数据", kv.GetString("list_corrupt", null));
-        // 取走即清
-        Assert.Null(s.TakeLoadNotice());
-        // 后续仍可正常添加账号（新数据会覆盖，但坏数据已留底）
-        s.AddDefault();
-        Assert.Equal(1, s.All().Count);
+        Assert.Throws<StoreLoadException>(() => new AccountsStore(kv));
+        Assert.Equal("{{{坏数据", kv.GetString("list", null));
+        Assert.Equal("]]]也是坏的", kv.GetString("list_prev", null));
     }
 
-    /// <summary>list 为合法数组但其中一条损坏 → 跳过坏条目，不算损坏事件</summary>
+    /// <summary>损坏条目跳过并提示，不把恢复动作悄悄隐藏。</summary>
     [Fact]
-    public void PartialCorruption_NoNotice()
+    public void PartialCorruption_ReportsSkippedEntries()
     {
         var kv = new FakeKv();
         kv.PutString("list", "[{\"id\":2,\"name\":\"好的\"},{\"id\":\"x\"}]");
         var s = new AccountsStore(kv);
-        Assert.Null(s.TakeLoadNotice());
-        Assert.Equal(1, s.All().Count);
+        Assert.Equal("corrupt", s.TakeLoadNotice());
+        Assert.Single(s.All());
         Assert.Equal("好的", s.All()[0].Name);
     }
 
@@ -203,7 +198,7 @@ public class AccountsStoreTest
     public void Notice_TakeOnce()
     {
         var kv = new FakeKv();
-        kv.PutString("list", "坏的");
+        kv.PutString("list", "[{\"id\":1,\"name\":\"valid\"},{\"id\":0,\"name\":\"invalid\"}]");
         var s = new AccountsStore(kv);
         Assert.Equal("corrupt", s.TakeLoadNotice());
         Assert.Null(s.TakeLoadNotice());

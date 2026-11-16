@@ -57,7 +57,7 @@
                            VerticalAlignment="Center" Margin="0,0,0,4"/>
             </Border>
             <StackPanel Margin="12,0,0,0" VerticalAlignment="Center">
-                <TextBox x:Name="AvatarInput" Style="{StaticResource FieldInput}" MaxLength="2"
+                <TextBox x:Name="AvatarInput" Style="{StaticResource FieldInput}"
                          TextChanged="OnAvatarChanged" Width="120" HorizontalAlignment="Left"/>
                 <TextBlock Text="1-2 个字符或 Emoji" Foreground="#8A9099" FontSize="11" Margin="0,4,0,0"/>
             </StackPanel>
@@ -77,13 +77,13 @@
                        VerticalAlignment="Center" TextWrapping="Wrap" MaxWidth="240" TextAlignment="Right"/>
         </DockPanel>
 
-        <!-- 强制走代理：避免 bypass 规则导致真实 IP 泄露 -->
-        <CheckBox x:Name="ForceProxyCheck" Content="强制所有流量走此代理（含本机地址，不绕过）"
+        <!-- 绕过控制仅约束浏览器的代理规则，不是系统级防直连 -->
+        <CheckBox x:Name="ForceProxyCheck" Content="取消浏览器本机地址的代理绕过（不是 VPN 防泄漏）"
                   Foreground="#C3C8D0" FontSize="11.5" Margin="0,10,0,0"/>
 
-        <TextBlock Text="留空则跟随系统网络，支持 http / https / socks5。保存后该账号的环境会立即按新代理重建（登录数据保留）。"
+        <TextBlock Text="支持 HTTP / HTTPS / SOCKS5 上游认证，由每账号本机桥接处理。保存后重建环境，账号目录保留。"
                    Foreground="#8A9099" FontSize="11" Margin="0,8,0,0" TextWrapping="Wrap"/>
-        <TextBlock Text="带账密写法：http://用户名:密码@host:端口 或 socks5://用户名:密码@host:端口（如 1024proxy 等住宅代理）"
+        <TextBlock Text="示例：http://用户名:密码@host:端口；特殊字符请百分号编码。HTTPS 上游验证证书；SOCKS5 由桥接完成真实认证。"
                    Foreground="#6F7680" FontSize="11" Margin="0,3,0,0" TextWrapping="Wrap"/>
 
         <!-- 标签 -->

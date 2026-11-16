@@ -1,213 +1,305 @@
+using System.Collections.Concurrent;
 using System.IO;
+using System.Windows;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 using MuseLauncher.Core;
 
 namespace MuseLauncher;
 
-/// <summary>
-/// 每个账号一个独立的 WebView2 实例（对应安卓的每账号 WebView + Profile）。
-/// 隔离方式：每账号独立 UserDataFolder + 独立浏览器进程，登录数据落盘各自目录；
-/// 代理通过环境创建参数 --proxy-server 实现，真正按账号生效。
-/// </summary>
-public sealed class AccountWebHost : IDisposable
+/// <summary>每账号独立的浏览器和本机代理桥接。初始化不导航，由调用方注册事件后开始加载。</summary>
+public sealed class AccountWebHost : IAsyncDisposable
 {
     public const string StartUrl = "https://muse.ai/";
-
-    /// <summary>muse.ai 登录会话 cookie（httpOnly）。匿名访问只会落下流程 cookie。</summary>
     public const string AuthCookieName = "hatch_sess";
+    private static readonly TimeSpan ExitTimeout = TimeSpan.FromSeconds(15);
+    private static readonly ConcurrentDictionary<string, Task> PendingProfileExits =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private readonly TaskCompletionSource<bool> browserExited =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly string profileDirectory;
+    private CoreWebView2Environment? environment;
+    private LoopbackProxyBridge? proxyBridge;
+    private Task? disposeTask;
+    private int? browserProcessId;
+    private bool disposing;
+    private bool failureReported;
 
     public long AccountId { get; }
     public WebView2 Control { get; }
-    public CoreWebView2 Core => Control.CoreWebView2;
+    public bool Loaded { get; private set; }
+    public bool Errored { get; private set; }
+    public string? ErrorMessage { get; private set; }
+    public bool HasNavigated { get; private set; }
+    public long? LoadStartAt { get; private set; }
+    public bool IsDisposed => disposing;
 
-    public bool Loaded { get; set; }
-    public bool Errored { get; set; }
-    public long? LoadStartAt { get; set; }
+    public CoreWebView2 Core
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(disposing, this);
+            return Control.CoreWebView2 ?? throw new InvalidOperationException("浏览器尚未初始化");
+        }
+    }
 
-    /// <summary>主框架导航开始（清错误标记的时机）</summary>
     public event Action<AccountWebHost>? NavigationStarting;
-
-    /// <summary>主框架导航完成：isSuccess / 错误描述（null=无）</summary>
     public event Action<AccountWebHost, bool, string?>? NavigationCompleted;
-
-    /// <summary>渲染进程崩溃/无响应（调用方负责销毁重建）</summary>
     public event Action<AccountWebHost>? RendererFailed;
 
-    private AccountWebHost(long accountId, WebView2 control)
+    private AccountWebHost(long accountId, string profileDirectory, WebView2 control)
     {
         AccountId = accountId;
+        this.profileDirectory = profileDirectory;
         Control = control;
     }
 
-    /// <summary>账号的 WebView2 用户数据目录（对应安卓 profile 名 acct_N）。</summary>
+    public static string ProfilesRoot => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "MuseLauncher", "Profiles");
+
     public static string ProfileDir(long id)
     {
-        return Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "MuseLauncher", "Profiles", "acct_" + id);
+        if (id <= 0) throw new ArgumentOutOfRangeException(nameof(id));
+        return Path.Combine(ProfilesRoot, "acct_" + id);
     }
 
-    /// <summary>
-    /// 创建账号环境并加载 muse.ai。attachControl 先把控件挂进可视化树再异步初始化，
-    /// 确保底层 HWND 有父窗口；失败时抛异常并自动把控件从树上摘除。
-    /// </summary>
-    public static async Task<AccountWebHost> CreateAsync(Account a, Action<WebView2> attachControl)
+    public static async Task<AccountWebHost> CreateAsync(
+        long accountId,
+        BrowserSessionConfiguration configuration,
+        Action<WebView2> attachControl,
+        CancellationToken cancellationToken = default)
     {
-        var wv = new WebView2
-        {
-            // 注意：WPF 控件的 DefaultBackgroundColor 是 System.Drawing.Color
-            DefaultBackgroundColor = System.Drawing.Color.FromArgb(255, 0x12, 0x13, 0x16),
-            CreationProperties = new CoreWebView2CreationProperties
-            {
-                UserDataFolder = ProfileDir(a.Id),
-                // 代理是浏览器进程级参数；每账号独立 UserDataFolder = 独立进程 = 代理真正按账号隔离
-                AdditionalBrowserArguments = string.Join(" ", ProxyUtil.BrowserArgsFor(a.Proxy, a.ForceProxy)),
-            },
-        };
+        cancellationToken.ThrowIfCancellationRequested();
+        var proxy = ProxyConfiguration.Parse(configuration.Proxy);
+        if (configuration.ForceProxy && proxy == null)
+            throw new FormatException("启用代理绕过控制时必须填写有效代理，不能回退为系统网络");
 
-        attachControl(wv);
+        var profile = Path.GetFullPath(configuration.ProfileDirectory ?? ProfileDir(accountId));
+        if (PendingProfileExits.TryGetValue(profile, out var pendingExit))
+        {
+            try { await pendingExit.WaitAsync(ExitTimeout, cancellationToken); }
+            catch (TimeoutException)
+            {
+                throw new IOException("旧浏览器仍在使用该账号目录。请稍后重试，或关闭其他使用此目录的启动器。");
+            }
+            PendingProfileExits.TryRemove(profile, out _);
+        }
+
+        var control = new WebView2
+        {
+            DefaultBackgroundColor = System.Drawing.Color.FromArgb(255, 0x12, 0x13, 0x16),
+            Visibility = Visibility.Hidden,
+        };
+        var host = new AccountWebHost(accountId, profile, control);
         try
         {
-            await wv.EnsureCoreWebView2Async();
+            if (proxy != null)
+                host.proxyBridge = await LoopbackProxyBridge.StartAsync(proxy, cancellationToken);
+
+            var arguments = new List<string>();
+            if (host.proxyBridge != null)
+                arguments.Add("--proxy-server=" + host.proxyBridge.Address.GetLeftPart(UriPartial.Authority));
+            if (configuration.ForceProxy)
+                arguments.Add("--proxy-bypass-list=<-loopback>");
+
+            var options = new CoreWebView2EnvironmentOptions(string.Join(" ", arguments))
+            {
+                ExclusiveUserDataFolderAccess = true,
+            };
+            host.environment = await CoreWebView2Environment.CreateAsync(null, profile, options);
+            host.environment.BrowserProcessExited += host.OnBrowserProcessExited;
+            cancellationToken.ThrowIfCancellationRequested();
+
+            attachControl(control);
+            // WebView2 的初始化不能真正取消；始终等待结束后清理，避免同一目录的初始化重叠。
+            await control.EnsureCoreWebView2Async(host.environment);
+            host.browserProcessId = (int)control.CoreWebView2.BrowserProcessId;
+            cancellationToken.ThrowIfCancellationRequested();
+            host.AttachEvents();
+            Log.I("MuseWebview", $"created id={accountId} proxy={(proxy == null ? "system" : proxy.DisplayAddress)}");
+            return host;
         }
         catch
         {
-            if (wv.Parent is System.Windows.Controls.Panel p) p.Children.Remove(wv);
+            if (host.browserProcessId == null && control.CoreWebView2 != null)
+            {
+                try { host.browserProcessId = (int)control.CoreWebView2.BrowserProcessId; } catch { }
+            }
+            await host.DisposeAsync();
             throw;
         }
+    }
 
-        var host = new AccountWebHost(a.Id, wv);
-        var core = wv.CoreWebView2;
-
-        // 407 代理鉴权：--proxy-server 不支持内嵌账密，账密在这里应答。
-        // 只对「目标 host 与配置的代理 host 一致」的挑战给凭证，避免把代理账密交给普通站点。
-        var proxyHost = ProxyUtil.ProxyHost(a.Proxy);
-        var proxyCreds = ProxyUtil.ParseProxyCreds(a.Proxy ?? "");
-        if (proxyCreds != null)
+    private void AttachEvents()
+    {
+        var core = Core;
+        core.BasicAuthenticationRequested += (_, e) =>
         {
-            core.BasicAuthenticationRequested += (_, e) =>
-            {
-                var challengeHost = Uri.TryCreate(e.Uri, UriKind.Absolute, out var u) ? u.Host : null;
-                if (proxyHost == null || !string.Equals(challengeHost, proxyHost, StringComparison.OrdinalIgnoreCase))
-                {
-                    return; // 非代理的普通站点鉴权：交给默认对话框
-                }
-                e.Response.UserName = proxyCreds[0];
-                e.Response.Password = proxyCreds[1];
-                Log.I("MuseProxy", $"407 answered id={a.Id} host={challengeHost} scheme={e.Challenge}");
-            };
+            if (disposing || proxyBridge == null) return;
+            // 只给本机桥接完整 origin 的固定 realm 提供随机本地凭证，绝不向 WebView2 提交上游密码。
+            if (!Uri.TryCreate(e.Uri, UriKind.Absolute, out var challenge)
+                || challenge.Scheme != proxyBridge.Address.Scheme
+                || !string.Equals(challenge.Host, proxyBridge.Address.Host, StringComparison.OrdinalIgnoreCase)
+                || challenge.Port != proxyBridge.Address.Port
+                || !string.Equals(e.Challenge.Trim(),
+                    "Basic realm=\"" + LoopbackProxyBridge.AuthenticationRealm + "\"", StringComparison.OrdinalIgnoreCase))
+                return;
 
-            // SOCKS5 账密不走 407：Chromium 用 --proxy-auth-scheme=basic 后由内核直接完成握手，
-            // 若仍未配置成功会走到这里，至少留日志便于排查。
-            Log.I("MuseProxy", $"proxy with creds id={a.Id} server={ProxyUtil.ProxyServerValue(a.Proxy!)}");
-        }
-
-        // 窗口级弹窗（target=_blank）与安卓 setSupportMultipleWindows(false) 行为对齐：
-        // 不开新窗口，改为当前视图内导航
+            e.Response.UserName = proxyBridge.Username;
+            e.Response.Password = proxyBridge.Password;
+        };
         core.NewWindowRequested += (_, e) =>
         {
             e.Handled = true;
-            if (!string.IsNullOrEmpty(e.Uri)) core.Navigate(e.Uri);
+            if (!disposing && IsWebUri(e.Uri)) core.Navigate(e.Uri);
         };
-
-        // 主框架导航事件（CoreWebView2 级事件只针对主框架，天然等价 isForMainFrame）
-        core.NavigationStarting += (_, _) => host.NavigationStarting?.Invoke(host);
-
+        core.NavigationStarting += (_, e) =>
+        {
+            if (disposing) { e.Cancel = true; return; }
+            if (!IsWebUri(e.Uri) && e.Uri != "about:blank") { e.Cancel = true; return; }
+            HasNavigated = true;
+            Errored = false;
+            ErrorMessage = null;
+            LoadStartAt = Environment.TickCount64;
+            NavigationStarting?.Invoke(this);
+        };
         core.NavigationCompleted += (_, e) =>
         {
-            string? errText = null;
-            if (!e.IsSuccess) errText = DescribeError(e.WebErrorStatus);
-            host.NavigationCompleted?.Invoke(host, e.IsSuccess, errText);
+            if (disposing || e.WebErrorStatus == CoreWebView2WebErrorStatus.OperationCanceled) return;
+            var success = e.IsSuccess && e.HttpStatusCode < 400;
+            Errored = !success;
+            Loaded |= success;
+            ErrorMessage = success ? null : e.IsSuccess
+                ? "HTTP " + e.HttpStatusCode + "（检查代理认证或目标站点响应）"
+                : DescribeError(e.WebErrorStatus);
+            if (LoadStartAt is long started)
+            {
+                Log.I("MusePerf", $"load end id={AccountId} cost={Environment.TickCount64 - started}ms errored={!success}");
+                LoadStartAt = null;
+            }
+            NavigationCompleted?.Invoke(this, success, ErrorMessage);
         };
-
-        // 渲染进程崩溃：重建该账号 WebView（Profile 数据不受影响，登录态保留）
         core.ProcessFailed += (_, e) =>
         {
-            if (e.ProcessFailedKind is CoreWebView2ProcessFailedKind.RenderProcessExited
+            if (e.ProcessFailedKind is CoreWebView2ProcessFailedKind.BrowserProcessExited
+                or CoreWebView2ProcessFailedKind.RenderProcessExited
                 or CoreWebView2ProcessFailedKind.RenderProcessUnresponsive
                 or CoreWebView2ProcessFailedKind.FrameRenderProcessExited)
             {
-                Log.I("MuseWebview", $"renderer failed id={a.Id} kind={e.ProcessFailedKind}");
-                host.RendererFailed?.Invoke(host);
+                Log.I("MuseWebview", $"process failed id={AccountId} kind={e.ProcessFailedKind}");
+                ReportFailure();
             }
         };
-
-        // 非网页协议交给系统打开（mailto: 等），镜像安卓 shouldOverrideUrlLoading
-        core.WebResourceRequested += (_, _) => { }; // 占位：无需拦截子资源
-
-        // muse.ai 需要 JS/存储（默认已开），保持默认下载对话框与文件选择器
-        wv.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
-
-        wv.Source = new Uri(StartUrl);
-        return host;
+        core.Settings.AreDefaultContextMenusEnabled = true;
     }
 
-    /// <summary>WebErrorStatus → 人类可读描述（镜像安卓 error.getDescription）。</summary>
-    private static string DescribeError(CoreWebView2WebErrorStatus status)
+    private void ReportFailure()
     {
-        return status switch
+        if (disposing || failureReported) return;
+        failureReported = true;
+        // 不在 WebView2 的同步回调中销毁控件或创建新窗口。
+        Control.Dispatcher.BeginInvoke(new Action(() =>
         {
-            CoreWebView2WebErrorStatus.Unknown => "未知错误",
-            CoreWebView2WebErrorStatus.CertificateCommonNameIsIncorrect => "证书域名不匹配",
-            CoreWebView2WebErrorStatus.CertificateExpired => "证书已过期",
-            CoreWebView2WebErrorStatus.ClientCertificateContainsErrors => "客户端证书错误",
-            CoreWebView2WebErrorStatus.CertificateRevoked => "证书已被吊销",
-            CoreWebView2WebErrorStatus.CertificateIsInvalid => "证书无效",
-            CoreWebView2WebErrorStatus.ServerUnreachable => "服务器无法访问",
-            CoreWebView2WebErrorStatus.Timeout => "连接超时",
-            CoreWebView2WebErrorStatus.ErrorHttpInvalidServerResponse => "服务器响应无效",
-            CoreWebView2WebErrorStatus.ConnectionAborted => "连接被中止",
-            CoreWebView2WebErrorStatus.ConnectionReset => "连接被重置",
-            CoreWebView2WebErrorStatus.Disconnected => "连接已断开",
-            CoreWebView2WebErrorStatus.CannotConnect => "无法建立连接",
-            CoreWebView2WebErrorStatus.HostNameNotResolved => "无法解析主机名（检查网络或代理）",
-            CoreWebView2WebErrorStatus.OperationCanceled => "操作已取消",
-            CoreWebView2WebErrorStatus.RedirectFailed => "重定向失败",
-            CoreWebView2WebErrorStatus.UnexpectedError => "意外错误",
-            CoreWebView2WebErrorStatus.ValidAuthenticationCredentialsRequired => "需要有效的身份凭证（检查代理账密）",
-            CoreWebView2WebErrorStatus.ValidProxyAuthenticationRequired => "需要有效的代理凭证",
-            _ => status.ToString(),
-        };
+            if (!disposing) RendererFailed?.Invoke(this);
+        }));
     }
+
+    private void OnBrowserProcessExited(object? sender, CoreWebView2BrowserProcessExitedEventArgs e)
+    {
+        if (browserProcessId is int expected && e.BrowserProcessId != expected) return;
+        browserExited.TrySetResult(true);
+        if (environment != null) environment.BrowserProcessExited -= OnBrowserProcessExited;
+        if (!disposing) ReportFailure();
+    }
+
+    private static bool IsWebUri(string value)
+        => Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https";
+
+    private static string DescribeError(CoreWebView2WebErrorStatus status) => status switch
+    {
+        CoreWebView2WebErrorStatus.CertificateCommonNameIsIncorrect => "证书域名不匹配",
+        CoreWebView2WebErrorStatus.CertificateExpired => "证书已过期",
+        CoreWebView2WebErrorStatus.CertificateIsInvalid => "证书无效",
+        CoreWebView2WebErrorStatus.ServerUnreachable => "服务器无法访问",
+        CoreWebView2WebErrorStatus.Timeout => "连接超时",
+        CoreWebView2WebErrorStatus.ConnectionAborted => "连接被中止",
+        CoreWebView2WebErrorStatus.ConnectionReset => "连接被重置",
+        CoreWebView2WebErrorStatus.CannotConnect => "无法建立连接（检查代理地址与协议）",
+        CoreWebView2WebErrorStatus.HostNameNotResolved => "无法解析主机名",
+        CoreWebView2WebErrorStatus.ValidProxyAuthenticationRequired => "本机代理认证失败",
+        CoreWebView2WebErrorStatus.ValidAuthenticationCredentialsRequired => "目标站点需要身份认证",
+        _ => status.ToString(),
+    };
 
     public void SetVisible(bool visible)
     {
-        Control.Visibility = visible ? System.Windows.Visibility.Visible : System.Windows.Visibility.Collapsed;
+        if (!disposing) Control.Visibility = visible ? Visibility.Visible : Visibility.Hidden;
     }
 
     public void Reload() => Core.Reload();
-
     public void Navigate(string url) => Core.Navigate(url);
-
-    public bool CanGoBack => Core.CanGoBack;
-
+    public bool CanGoBack => !disposing && Control.CoreWebView2?.CanGoBack == true;
     public void GoBack() => Core.GoBack();
 
-    /// <summary>读取 muse.ai 的 cookie 名列表（用于登录态探测）。</summary>
     public async Task<List<string>> GetMuseCookieNamesAsync()
     {
         var cookies = await Core.CookieManager.GetCookiesAsync("https://muse.ai/");
         return cookies.Select(c => c.Name).ToList();
     }
 
-    /// <summary>执行 JS 取 localStorage 键与 document.cookie（调试 dump_auth 用）。</summary>
-    public async Task<string> EvalAuthStateAsync()
+    /// <summary>诊断只输出 localStorage 键和 cookie 名，不记录 cookie 值。</summary>
+    public Task<string> EvalAuthStateAsync() => Core.ExecuteScriptAsync(
+        "(function(){try{return JSON.stringify({storageKeys:Object.keys(localStorage),"
+        + "cookieNames:document.cookie.split(';').filter(Boolean).map(x=>x.trim().split('=')[0])})}"
+        + "catch(e){return 'unavailable'}})()");
+
+    public ValueTask DisposeAsync()
     {
-        return await Core.ExecuteScriptAsync(
-            "(function(){try{return 'LS:'+(Object.keys(localStorage).join(',')||'-')"
-            + "+'|CK:'+document.cookie}catch(e){return 'ERR:'+e}})()");
+        Control.Dispatcher.VerifyAccess();
+        disposeTask ??= DisposeCoreAsync();
+        return new ValueTask(disposeTask);
     }
 
-    public void Dispose()
+    private async Task DisposeCoreAsync()
     {
+        disposing = true;
+        NavigationStarting = null;
+        NavigationCompleted = null;
+        RendererFailed = null;
+        if (browserProcessId != null)
+            PendingProfileExits[profileDirectory] = browserExited.Task;
+
+        Exception? failure = null;
         try
         {
+            if (Control.Parent is System.Windows.Controls.Panel panel) panel.Children.Remove(Control);
             Control.Dispose();
         }
-        catch (Exception ex)
+        catch (Exception ex) { failure = ex; }
+        try
         {
-            Log.I("MuseWebview", $"dispose error id={AccountId}: {ex.Message}");
+            if (proxyBridge != null) await proxyBridge.DisposeAsync();
         }
+        catch (Exception ex) { failure ??= ex; }
+
+        if (browserProcessId != null)
+        {
+            try
+            {
+                await browserExited.Task.WaitAsync(ExitTimeout);
+                PendingProfileExits.TryRemove(profileDirectory, out _);
+            }
+            catch (TimeoutException)
+            {
+                failure ??= new IOException("等待旧浏览器退出超时。账号数据未删除，请关闭其他使用此目录的窗口后重试。");
+            }
+        }
+        else if (environment != null)
+        {
+            environment.BrowserProcessExited -= OnBrowserProcessExited;
+        }
+        if (failure != null) throw failure;
     }
 }
